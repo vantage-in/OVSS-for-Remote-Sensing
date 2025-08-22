@@ -246,19 +246,13 @@ class SegEarthSegmentation(BaseSegmentor):
                     feat.reshape(B, H_feat, W_feat, C)        # (B, H', W', C)
                     .permute(0, 3, 1, 2).contiguous()     # (B, C, H', W')
                 )
-            # ex_feats = F.interpolate(ex_feats, size=(imgs_norm.shape[-2], imgs_norm.shape[-1]), mode='bilinear', align_corners=False)
+            ex_feats = F.interpolate(ex_feats, size=(imgs_norm.shape[-2], imgs_norm.shape[-1]), mode='bilinear', align_corners=False)
             
             # Similarity attn map
             ex_feats = ex_feats.reshape(ex_feats.shape[0], ex_feats.shape[1], -1)
             ex_feats = F.normalize(ex_feats, dim=1)
             similarity = torch.einsum("b c m, b c n -> b m n", ex_feats, ex_feats)
-
-            # --
-            beta = 1.2
-            gamma = 3.0
-            similarity = (similarity - torch.mean(similarity) * beta) * gamma
-            # --
-            similarity[similarity < 0.0] = float('-inf')
+            similarity[similarity < 0.3] = float('-inf')
             attn = F.softmax(similarity, dim=-1)
 
             return {'ex_feats': ex_feats, 'attn': attn} 
@@ -268,22 +262,7 @@ class SegEarthSegmentation(BaseSegmentor):
             patch_size = self.vfm.image_encoder.patch_embed.proj.kernel_size
             imgs_resized = F.interpolate(imgs_norm, size=(1024, 1024), mode='bilinear', align_corners=False)
             ex_feats = self.vfm.image_encoder(imgs_resized)  # already (B, C, H', W')
-
-            ex_feats = F.interpolate(ex_feats, size=(imgs_norm.shape[-2], imgs_norm.shape[-1]), mode='bilinear', align_corners=False)
-
-            # Similarity attn map
-            ex_feats = ex_feats.reshape(ex_feats.shape[0], ex_feats.shape[1], -1)
-            ex_feats = F.normalize(ex_feats, dim=1)
-            similarity = torch.einsum("b c m, b c n -> b m n", ex_feats, ex_feats)
-
-            # # --
-            # beta = 1.2
-            # gamma = 3.0
-            # similarity = (similarity - torch.mean(similarity) * beta) * gamma
-            # # --
-            similarity[similarity < 0.0] = float('-inf')
-            attn = F.softmax(similarity/0.1, dim=-1)
-            return {'ex_feats': ex_feats, 'attn': attn}
+            return {'ex_feats': ex_feats, 'attn': None}
 
         elif self.vfm_model.lower() == 'mae':
             # MAE ViT backbone
@@ -404,37 +383,59 @@ class SegEarthSegmentation(BaseSegmentor):
             image_features = self.net.visual(img)
         else:
             image_features = self.net.encode_image(img, self.model_type, self.ignore_residual, self.output_cls_token)
-            # [1, 196, 512]
-
+            
+        # sigma = 4.0
+        # blur_img = T.GaussianBlur(kernel_size=int(max(3, 4 * sigma + 1)), sigma=sigma)(img.float()).half()
+        # blur_img_features = self.net.encode_image(blur_img, self.model_type, self.ignore_residual, self.output_cls_token)
+        
         if self.output_cls_token:
             image_cls_token, image_features = image_features
             image_cls_token /= image_cls_token.norm(dim=-1, keepdim=True)
             # cls_logits = image_cls_token @ self.query_features.T
             cls_logits = self.compute_cls_logits(img)
+            # blur_img_cls_token, blur_img_features = blur_img_features
 
         # featup
         if self.feature_up:
             feature_w, feature_h = img[0].shape[-2] // self.patch_size[0], img[0].shape[-1] // self.patch_size[1]
             image_w, image_h = img[0].shape[-2], img[0].shape[-1]
-            image_features = image_features.permute(0, 2, 1).view(1, self.feat_dim, feature_w, feature_h) # [1, 512, 14, 14]
+            image_features = image_features.permute(0, 2, 1).view(1, self.feat_dim, feature_w, feature_h)
+            # blur_img_features_up = blur_img_features.permute(0, 2, 1).view(1, self.feat_dim, feature_w, feature_h)
             with torch.cuda.amp.autocast():
-                image_features = self.upsampler(image_features, img).half()   
-                # --- Upsample with refinement ---
-                # image_features = self.upsampler.up2(image_features, img).half() 
-                # # refine 1
+                image_features = self.upsampler(image_features, img).half()         
+                # blur_img_features_up = self.upsampler(blur_img_features_up, blur_img).half()
+            image_features = image_features.view(1, self.feat_dim, image_w * image_h).permute(0, 2, 1)
+            # blur_img_features_up = blur_img_features_up.view(1, self.feat_dim, image_w * image_h).permute(0, 2, 1)
 
-                # image_features = self.upsampler.up4(image_features, img).half()
-                # # refine 2
-
-                # image_features = self.upsampler.up8(image_features, img).half()
-                # image_features = self.upsampler.up16(image_features, img).half() # [1, 512, 224, 224]
-                # -------------------------------- 
-            image_features = image_features.view(1, self.feat_dim, -1).permute(0, 2, 1) # image_w * image_h  [1, 50176, 512]
         image_features /= image_features.norm(dim=-1, keepdim=True)
         logits = image_features @ self.query_features.T
 
+        # blur_img_features /= blur_img_features.norm(dim=-1, keepdim=True)
+        # blur_img_features_up /= blur_img_features_up.norm(dim=-1, keepdim=True)
+        # blur_logits = blur_img_features @ self.query_features.T
+        # w, h = img[0].shape[-2] // self.patch_size[0], img[0].shape[-1] // self.patch_size[1]
+        # out_dim = blur_logits.shape[-1]
+        # blur_logits = blur_logits.permute(0, 2, 1).reshape(-1, out_dim, w, h)
+        # blur_logits = nn.functional.interpolate(blur_logits, size=img.shape[-2:], mode='bilinear')
+        # blur_logits = blur_logits.view(1, out_dim, image_w*image_h).permute(0, 2, 1)
+        # blur_logits_up = blur_img_features_up @ self.query_features.T
+        # logits = 3 * logits - 2 * (blur_logits_up - blur_logits)
+
         if self.output_cls_token:
             logits = logits + cls_logits * self.cls_token_lambda
+
+            # # CLIP Surgery
+            # # weights to restrain influence of obvious classes on others
+            # prob = (cls_logits * 2).softmax(-1)
+            # w = prob / prob.mean(-1, keepdim=True)
+            # # element-wise multiplied features
+            # b, n_t, n_i, c = image_features.shape[0], self.query_features.shape[0], image_features.shape[1], image_features.shape[2]
+            # feats = image_features.reshape(b, n_i, 1, c) * self.query_features.reshape(1, 1, n_t, c)
+            # feats *= w.reshape(1, 1, n_t, 1)
+            # redundant_feats = feats.mean(2, keepdim=True) # along cls dim
+            # feats = feats - redundant_feats
+            # # sum the element-wise multiplied features as cosine similarity
+            # logits = feats.sum(-1)
 
         if self.feature_up:
             w, h = img[0].shape[-2], img[0].shape[-1]

@@ -23,8 +23,11 @@ from typing import Optional
 import math, os
 import numpy as np
 
+from myutils import UnNormalize
+from segment_anything import sam_model_registry
+
 @MODELS.register_module()
-class SegEarthSegmentation(BaseSegmentor):
+class SamProxySegEarthSegmentation(BaseSegmentor):
     def __init__(self,
                  clip_type,
                  vit_type,
@@ -169,191 +172,40 @@ class SegEarthSegmentation(BaseSegmentor):
         self.cls_variant = 'none' if cls_variant is None else cls_variant.lower()
 
         self.vfm_model = vfm_model
-        if vfm_model is None:
-            self.vfm = None
-        elif vfm_model.lower() == 'dino':
-            # ViT‑B/8 gives the best spatial resolution while staying light‑weight
-            self.vfm = torch.hub.load('facebookresearch/dino:main', 'dino_vitb8').requires_grad_(False).eval().to(device)
-        elif vfm_model.lower() == 'dinov2':
-            self.vfm = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg').requires_grad_(False).eval().to(device)
-        elif vfm_model.lower() == 'sam':
-            from segment_anything import sam_model_registry            # type: ignore
-            self.vfm = sam_model_registry['vit_b']().requires_grad_(False).eval().to(device)
-        elif vfm_model.lower() == 'mae':
-            from mae import models_vit                                            # type: ignore
-            self.vfm = models_vit.__dict__['vit_base_patch16'](img_size=self.slide_crop, num_classes=0, global_pool=False)
-            self.vfm = self.vfm.requires_grad_(False).eval().to(device)
+        if vfm_model == 'sam':
+            checkpoint=None
+            self.vfm = sam_model_registry["vit_b"](checkpoint=checkpoint)
+            # self.vfm = sam_model_registry["vit_l"](checkpoint=checkpoint)
+        elif vfm_model == 'dino':
+            # self.vfm = torch.hub.load('facebookresearch/dino:main', 'dino_vits16')
+            # self.vfm = torch.hub.load('facebookresearch/dino:main', 'dino_vits8')
+            # self.vfm = torch.hub.load('facebookresearch/dino:main', 'dino_vitb16')
+            self.vfm = torch.hub.load('facebookresearch/dino:main', 'dino_vitb8')
+        elif vfm_model == 'dinov2':
+            # self.vfm = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14_reg')
+            self.vfm = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg')
+        elif vfm_model == 'mae':
+            self.vfm = models_vit.__dict__['vit_base_patch16'](img_size=slide_crop, num_classes=0, global_pool=False)
+            checkpoint_model = torch.load(checkpoint, map_location='cpu')['model']
+            state_dict = self.vfm.state_dict()
+            for k in ['head.weight', 'head.bias']:
+                if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                    print(f"Removing key {k} from pretrained checkpoint")
+                    del checkpoint_model[k]
+            # interpolate position embedding
+            interpolate_pos_embed(self.vfm, checkpoint_model)
+            # load pre-trained model
+            self.vfm.load_state_dict(checkpoint_model, strict=False)
         else:
-            raise ValueError(f"Unsupported vfm_model: {vfm_model}")
+            print("vlm_model not supported")
 
-    # ----------------------------------------------------------------------
-    # VFM forward – returns ex_feats **and** attention map
-    # ----------------------------------------------------------------------
-    @torch.no_grad()
-    def vfm_forward(self, imgs_norm: torch.Tensor):
-        """Compute *external features* (ex_feats) and, when available, the
-        last‑block multi‑head attention map from the VFM.
-        
-        Parameters
-        ----------
-        imgs_norm : torch.Tensor
-            Normalised images (B, 3, H, W) in the **same** resolution you feed
-            to CLIP.
-        Returns
-        -------
-        dict with keys:
-            ex_feats : Tensor (B, C, H', W') – patch embeddings as spatial map
-            attn     : Tensor (B, heads, N, N) – attention probabilities (only
-                         when the backbone is ViT‑family; else None)
-        """
-        if self.vfm is None:
-            return {'ex_feats': None, 'attn': None}
+        self.vfm = self.vfm.half()
+        for p in self.vfm.parameters():
+            p.requires_grad = False
+        self.vfm.eval().to(device)
 
-        vfm_dtype = next(self.vfm.parameters()).dtype
-        imgs_norm = imgs_norm.to(dtype=vfm_dtype)
-
-        if self.vfm_model.lower() in {'dino', 'dinov2'}:
-            # --------------------------------------------------------------
-            # ViT‑style backbones (DINO / DINOv2)
-            # --------------------------------------------------------------
-            feat_out = {}
-            def _hook(module, _in, out):
-                feat_out['qkv'] = out  # (B, N+1, 3*D)
-            # register the hook only once
-            if not hasattr(self, '_dino_hook_registered'):
-                self.vfm.blocks[-1].attn.qkv.register_forward_hook(_hook)
-                self._dino_hook_registered = True
-
-            # Forward through VFM – we only need the *last* layer’s output
-            feat = self.vfm.get_intermediate_layers(imgs_norm, n=1)[0]  # (B, N+1, D)
-
-            B, N1, C = feat.shape  # N1 = N+1 (CLS + patches)
-            if self.vfm_model.lower() == 'dino':
-                N = N1 - 1             # number of patch tokens
-            else: # dinov2
-                N = N1
-            H_feat = W_feat = int(math.sqrt(N))  # assumes square grid
-
-            # 1. external features in (B, C, H', W') order
-            if self.vfm_model.lower() == 'dino':    
-                ex_feats = (
-                    feat[:, 1:, :]                        # drop CLS
-                    .reshape(B, H_feat, W_feat, C)        # (B, H', W', C)
-                    .permute(0, 3, 1, 2).contiguous()     # (B, C, H', W')
-                )
-            else:
-                ex_feats = (
-                    feat.reshape(B, H_feat, W_feat, C)        # (B, H', W', C)
-                    .permute(0, 3, 1, 2).contiguous()     # (B, C, H', W')
-                )
-            # ex_feats = F.interpolate(ex_feats, size=(imgs_norm.shape[-2], imgs_norm.shape[-1]), mode='bilinear', align_corners=False)
-            
-            # Similarity attn map
-            ex_feats = ex_feats.reshape(ex_feats.shape[0], ex_feats.shape[1], -1)
-            ex_feats = F.normalize(ex_feats, dim=1)
-            similarity = torch.einsum("b c m, b c n -> b m n", ex_feats, ex_feats)
-
-            # --
-            beta = 1.2
-            gamma = 3.0
-            similarity = (similarity - torch.mean(similarity) * beta) * gamma
-            # --
-            similarity[similarity < 0.0] = float('-inf')
-            attn = F.softmax(similarity, dim=-1)
-
-            return {'ex_feats': ex_feats, 'attn': attn} 
-
-        elif self.vfm_model.lower() == 'sam':
-            # SAM’s image encoder returns (B, C, H', W') directly
-            patch_size = self.vfm.image_encoder.patch_embed.proj.kernel_size
-            imgs_resized = F.interpolate(imgs_norm, size=(1024, 1024), mode='bilinear', align_corners=False)
-            ex_feats = self.vfm.image_encoder(imgs_resized)  # already (B, C, H', W')
-
-            ex_feats = F.interpolate(ex_feats, size=(imgs_norm.shape[-2], imgs_norm.shape[-1]), mode='bilinear', align_corners=False)
-
-            # Similarity attn map
-            ex_feats = ex_feats.reshape(ex_feats.shape[0], ex_feats.shape[1], -1)
-            ex_feats = F.normalize(ex_feats, dim=1)
-            similarity = torch.einsum("b c m, b c n -> b m n", ex_feats, ex_feats)
-
-            # # --
-            # beta = 1.2
-            # gamma = 3.0
-            # similarity = (similarity - torch.mean(similarity) * beta) * gamma
-            # # --
-            similarity[similarity < 0.0] = float('-inf')
-            attn = F.softmax(similarity/0.1, dim=-1)
-            return {'ex_feats': ex_feats, 'attn': attn}
-
-        elif self.vfm_model.lower() == 'mae':
-            # MAE ViT backbone
-            patch_size = self.vfm.patch_embed.patch_size
-            imgs_resized = F.interpolate(imgs_norm, size=(self.slide_crop, self.slide_crop), mode='bilinear', align_corners=False)
-            B = imgs_resized.size(0)
-            I = imgs_resized.size(2) // patch_size[0]
-            image_feat = self.vfm.forward_features(imgs_resized)        # (B, N, C)
-            ex_feats = image_feat.view(B, I, I, -1).permute(0, 3, 1, 2)  # (B, C, I, I)
-            return {'ex_feats': ex_feats, 'attn': None}
-
-        else:
-            # Should never reach here because of constructor validation
-            return {'ex_feats': None, 'attn': None}
-
-    @torch.no_grad()
-    def viz_patch_attention(self, imgs, layer=-1, head=0, x_pix=None, y_pix=None, save_dir=None, dpi=150):
-        idx_q = y_pix * imgs.shape[-2] + x_pix
-        
-        dir_path = os.path.dirname(save_dir)
-        prefix   = os.path.basename(save_dir)
-
-        attn = self.vfm_forward(imgs)['attn'] # (B, N, N)
-        if attn is None:
-            raise RuntimeError("Current VFM does not expose attention maps!")
-
-        B, N, _ = attn.shape
-        hw = int(math.sqrt(N))
-        
-        if idx_q is None:
-            idx_q = (grid_h // 2) * grid_w + (grid_w // 2)  # centre patch
-
-        img_disp = (imgs[0].permute(1,2,0).cpu().numpy() * 0.5 + 0.5)
-        
-        heat = attn[0][idx_q].cpu().reshape(hw, hw)  # (H', W')
-        heat_up = F.interpolate(heat.unsqueeze(0).unsqueeze(0), size=imgs.shape[-2:], mode="bilinear", align_corners=False).squeeze(0).squeeze(0).detach().numpy()
-        heat_up = heat_up / np.max(heat_up)
-
-        # ── 1) idx_q → (cx, cy) 픽셀 좌표 ─────────────────────────────
-        patch_h = imgs.shape[-2] // hw     # = patch_w
-        patch_w = imgs.shape[-1] // hw
-        row_q   = idx_q // hw
-        col_q   = idx_q %  hw
-        cy      = row_q * patch_h + patch_h // 2   # y (row)  중심
-        cx      = col_q * patch_w + patch_w // 2   # x (col)  중심
-
-        import matplotlib.pyplot as plt
-        fig, ax = plt.subplots(
-            1, 2, figsize=((imgs.shape[-1]*2)/dpi, imgs.shape[-2]/dpi), dpi=dpi)
-
-        # 왼쪽 : 원본 + 표시점
-        ax[0].imshow(img_disp)
-        ax[0].scatter(cx, cy, s=8, c='red', marker='x', linewidths=1)
-        ax[0].set_title(f"Query patch ({y_pix}, {x_pix})", fontsize=5)
-        ax[0].axis("off")
-
-        # 오른쪽 : 히트맵 overlay
-        ax[1].imshow(img_disp)
-        ax[1].imshow(heat_up, alpha=0.7, cmap="jet", vmin=0, vmax=1)
-        ax[1].set_title("Attention heat‑map", fontsize=5)
-        ax[1].axis("off")
-
-        # ── 3) 저장 ────────────────────────────────────────────────
-        file_name = f"{prefix}_{y_pix}_{x_pix}.png"
-        file_path = os.path.join(dir_path, file_name)
-        plt.savefig(file_path, bbox_inches="tight", pad_inches=0)
-        plt.close(fig)
-
-        print(f"Saved attention maps to '{file_path}'")
-
+        self.unnorm = UnNormalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711])
+        self.norm = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
     @torch.no_grad()
     def compute_cls_logits(self, img: torch.Tensor,
@@ -386,14 +238,101 @@ class SegEarthSegmentation(BaseSegmentor):
             cls_emb = self.net.vision_proj(cls_emb)         # [1, D]
         else:
             cls_emb, _ = self.net.encode_image(
-                v_img.half(), self.model_type,
-                self.ignore_residual, output_cls_token=True)  # [1, D]
+                v_img.half(), self.model_type, ex_feats=None,
+                ignore_residual=self.ignore_residual, output_cls_token=True)  # [1, D]
 
         cls_emb = cls_emb / cls_emb.norm(dim=-1, keepdim=True)
         cls_logits = cls_emb @ self.query_features.T          # [1, Q]
         return cls_logits
 
-    def forward_feature(self, img, logit_size=None):
+    def forward_feature(self, img, sam_img, logit_size=None):
+        clip_token_size = img.shape[-2] // self.net.visual.patch_size[0], img.shape[-1] // self.net.visual.patch_size[1]
+
+        imgs_norm = [self.norm(self.unnorm(img[i])) for i in range(len(img))]
+        imgs_norm = torch.stack(imgs_norm, dim=0)
+
+        imgs_norm = imgs_norm.half()
+
+        if self.vfm_model == 'sam':
+            patch_size = self.vfm.image_encoder.patch_embed.proj.kernel_size
+            imgs_norm = sam_img.to('cuda').half()
+            I, J = imgs_norm.shape[-2] // patch_size[0], imgs_norm.shape[-2] // patch_size[1]
+            ex_feats = self.vfm.image_encoder(imgs_norm) # [1, 768, 64, 64]
+        elif self.vfm_model == 'dino':
+            feat_out = {}
+            def hook_fn_forward_qkv(module, input, output):
+                feat_out["qkv"] = output
+            self.vfm._modules["blocks"][-1]._modules["attn"]._modules["qkv"].register_forward_hook(
+                hook_fn_forward_qkv)
+
+            # Forward pass in the model
+            feat = self.vfm.get_intermediate_layers(imgs_norm)[0]
+
+            nb_im = feat.shape[0]  # Batch size
+            nb_tokens = feat.shape[1]  # Number of tokens
+            nh = self.vfm.blocks[0].attn.num_heads  # Number of heads
+
+            qkv = (
+                feat_out["qkv"]
+                .reshape(nb_im, nb_tokens, 3, nh, -1 // nh)
+                .permute(2, 0, 3, 1, 4)
+            )
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            k = k.transpose(1, 2).reshape(nb_im, nb_tokens, -1)[:, 1:, :]
+            q = q.transpose(1, 2).reshape(nb_im, nb_tokens, -1)[:, 1:, :]
+            v = v.transpose(1, 2).reshape(nb_im, nb_tokens, -1)[:, 1:, :]
+
+            patch_size = self.vfm.patch_embed.patch_size
+            I, J = imgs_norm[0].shape[-2] // patch_size, imgs_norm[0].shape[-2] // patch_size
+
+            # ex_feats = q.reshape(nb_im, I, J, -1).permute(0, 3, 1, 2)
+            # ex_feats = k.reshape(nb_im, I, J, -1).permute(0, 3, 1, 2)
+            # ex_feats = v.reshape(nb_im, I, J, -1).permute(0, 3, 1, 2)
+            ex_feats = feat[:, 1:, :].reshape(nb_im, I, J, -1).permute(0, 3, 1, 2)
+        elif self.vfm_model == 'dinov2':
+            patch_size = self.vfm.patch_embed.patch_size
+            I, J = imgs_norm.shape[-2] // patch_size[0], imgs_norm.shape[-2] // patch_size[1]
+            ex_feats = self.vfm.get_intermediate_layers(imgs_norm, reshape=True)[0]
+        elif self.vfm_model == 'mae':
+            patch_size = self.vfm.patch_embed.patch_size
+            imgs_norm = F.interpolate(imgs_norm, size=(self.slide_crop, self.slide_crop), mode='bilinear', align_corners=False)
+            I, J = imgs_norm.shape[-2] // patch_size[0], imgs_norm.shape[-2] // patch_size[1]
+            image_feat = self.vfm.forward_features(imgs_norm)
+            ex_feats = rearrange(image_feat, 'b (h w) c -> b c h w', h=I, w=J)
+        else:
+            I, J = clip_token_size
+            ex_feats = None
+        
+        # # --- DINO attention ---
+        # beta = 1.2
+        # gamma = 3.0
+        # temperature = 0.7
+        # lam = 0.5
+
+        # ex_feats_2 = F.interpolate(ex_feats, size=(2*ex_feats.shape[-2], 2*ex_feats.shape[-1]),
+        #                             mode='bilinear', align_corners=False)
+        # # ex_feats_3 = F.interpolate(ex_feats, size=(4*ex_feats.shape[-2], 4*ex_feats.shape[-1]),
+        # #                             mode='bilinear', align_corners=False)
+        # # ex_feats_4 = F.interpolate(ex_feats, size=(8*ex_feats.shape[-2], 8*ex_feats.shape[-1]),
+        # #                             mode='bilinear', align_corners=False)
+
+        # def get_attn(feats):
+        #     q_k = F.normalize(feats.flatten(2, 3), dim=1) # [1, 768, 784]
+        #     similarity = torch.einsum("b c m, b c n -> b m n", q_k, q_k) # [1, 784, 784]
+            
+        #     similarity = (similarity - torch.mean(similarity) * beta) * gamma
+        #     similarity[similarity < 0.0] = float('-inf')
+
+        #     attn_weights = F.softmax(similarity/temperature, dim=-1) # [1, 784, 784]
+        #     return attn_weights
+
+        # # attn_weights = get_attn(ex_feats)
+        # attn_weights_2 = get_attn(ex_feats_2)
+        # # attn_weights_3 = get_attn(ex_feats_3)
+        # # attn_weights_4 = get_attn(ex_feats_4)
+
+        # # --- Dino attention ---
+
         if type(img) == list:
             img = img[0]
         if self.clip_type == 'BLIP':
@@ -403,12 +342,12 @@ class SegEarthSegmentation(BaseSegmentor):
         elif self.model_type == 'GEM':
             image_features = self.net.visual(img)
         else:
-            image_features = self.net.encode_image(img, self.model_type, self.ignore_residual, self.output_cls_token)
-            # [1, 196, 512]
-
+            image_features = self.net.encode_image(img, self.model_type, self.ignore_residual, output_cls_token=False, ex_feats=ex_feats)#self.output_cls_token)
+            
+        
         if self.output_cls_token:
-            image_cls_token, image_features = image_features
-            image_cls_token /= image_cls_token.norm(dim=-1, keepdim=True)
+            # image_cls_token, image_features = image_features
+            # image_cls_token /= image_cls_token.norm(dim=-1, keepdim=True)
             # cls_logits = image_cls_token @ self.query_features.T
             cls_logits = self.compute_cls_logits(img)
 
@@ -416,31 +355,71 @@ class SegEarthSegmentation(BaseSegmentor):
         if self.feature_up:
             feature_w, feature_h = img[0].shape[-2] // self.patch_size[0], img[0].shape[-1] // self.patch_size[1]
             image_w, image_h = img[0].shape[-2], img[0].shape[-1]
-            image_features = image_features.permute(0, 2, 1).view(1, self.feat_dim, feature_w, feature_h) # [1, 512, 14, 14]
+            #image_features = image_features.permute(0, 2, 1).view(1, self.feat_dim, feature_w, feature_h)
+            image_features = image_features.permute(0, 2, 1).view(1, self.feat_dim, 64, 64)
             with torch.cuda.amp.autocast():
-                image_features = self.upsampler(image_features, img).half()   
+                image_features = F.interpolate(image_features, size=(56, 56),
+                                      mode='bilinear', align_corners=False)
+                #image_features = self.upsampler(image_features, img).half()
                 # --- Upsample with refinement ---
-                # image_features = self.upsampler.up2(image_features, img).half() 
+                # image_features = self.upsampler.up2(image_features, img).half() # [1, 512, 28, 28]
                 # # refine 1
+                # image_features = image_features.view(1, self.feat_dim, -1)
+                # refine1 = torch.einsum("b c n, b q n -> b c q", image_features, attn_weights) # [1, 512, 784]
+                # image_features = (refine1 + lam * image_features).view(1, self.feat_dim, 2*feature_w, 2*feature_h)
 
-                # image_features = self.upsampler.up4(image_features, img).half()
+                # image_features = self.upsampler.up4(image_features, img).half() # [1, 512, 56, 56]
                 # # refine 2
+                # image_features = image_features.view(1, self.feat_dim, -1)
+                # refine2 = torch.einsum("b c n, b q n -> b c q", image_features, attn_weights_2)
+                # image_features = (refine2 + lam * image_features).view(1, self.feat_dim, 4*feature_w, 4*feature_h)
 
-                # image_features = self.upsampler.up8(image_features, img).half()
-                # image_features = self.upsampler.up16(image_features, img).half() # [1, 512, 224, 224]
+                image_features = self.upsampler.up8(image_features, img).half() # [1, 512, 112, 112]
+                # # refine 3
+                # image_features = image_features.view(1, self.feat_dim, -1)
+                # refine3 = torch.einsum("b c n, b q n -> b c q", image_features, attn_weights_3)
+                # image_features = (refine3 + lam * image_features).view(1, self.feat_dim, 8*feature_w, 8*feature_h)
+
+                image_features = self.upsampler.up16(image_features, img).half() # [1, 512, 224, 224]
+                # refine 4
+                # image_features = image_features.view(1, self.feat_dim, -1)
+                # refine4 = torch.einsum("b c n, b q n -> b c q", image_features, attn_weights_4)
+                # image_features = (refine4 + lam * image_features).view(1, self.feat_dim, 16*feature_w, 16*feature_h)
+
+                image_features = self.upsampler.fixup(image_features).half()
                 # -------------------------------- 
-            image_features = image_features.view(1, self.feat_dim, -1).permute(0, 2, 1) # image_w * image_h  [1, 50176, 512]
+            image_features = image_features.view(1, self.feat_dim, image_w * image_h).permute(0, 2, 1)
+
         image_features /= image_features.norm(dim=-1, keepdim=True)
         logits = image_features @ self.query_features.T
 
         if self.output_cls_token:
             logits = logits + cls_logits * self.cls_token_lambda
 
+            # # CLIP Surgery
+            # # weights to restrain influence of obvious classes on others
+            # prob = (cls_logits * 2).softmax(-1)
+            # w = prob / prob.mean(-1, keepdim=True)
+            # # element-wise multiplied features
+            # b, n_t, n_i, c = image_features.shape[0], self.query_features.shape[0], image_features.shape[1], image_features.shape[2]
+            # feats = image_features.reshape(b, n_i, 1, c) * self.query_features.reshape(1, 1, n_t, c)
+            # feats *= w.reshape(1, 1, n_t, 1)
+            # redundant_feats = feats.mean(2, keepdim=True) # along cls dim
+            # feats = feats - redundant_feats
+            # # sum the element-wise multiplied features as cosine similarity
+            # logits = feats.sum(-1)
+
         if self.feature_up:
             w, h = img[0].shape[-2], img[0].shape[-1]
         else:
             w, h = img[0].shape[-2] // self.patch_size[0], img[0].shape[-1] // self.patch_size[1]
         out_dim = logits.shape[-1]
+
+        # for proxy and not featup only
+        # if self.vfm_model is not None:
+        #     logits = logits.permute(0, 2, 1).reshape(-1, out_dim, I, J)
+        # else:
+        #     logits = logits.permute(0, 2, 1).reshape(-1, out_dim, w, h)
         logits = logits.permute(0, 2, 1).reshape(-1, out_dim, w, h)
 
         if logit_size == None:
@@ -508,7 +487,7 @@ class SegEarthSegmentation(BaseSegmentor):
 
         return logits
 
-    def forward_slide(self, img, img_metas, stride=112, crop_size=224):
+    def forward_slide(self, img, sam_inputs, img_metas, stride=112, crop_size=224):
         """Inference by sliding-window with overlap.
         If h_crop > h_img or w_crop > w_img, the small patch will be used to
         decode without padding.
@@ -528,6 +507,16 @@ class SegEarthSegmentation(BaseSegmentor):
         w_grids = max(w_img - w_crop + w_stride - 1, 0) // w_stride + 1
         preds = img.new_zeros((batch_size, out_channels, h_img, w_img))
         count_mat = img.new_zeros((batch_size, 1, h_img, w_img))
+
+        # SAM
+        if sam_inputs is not None:
+            # sam_inputs : [B, C, 2048, 2048]  (가정)
+            sam_h_stride, sam_w_stride = 512, 512
+            sam_h_crop,   sam_w_crop   = 1024, 1024
+            _, H_sam, W_sam = sam_inputs.shape
+            sam_inputs = sam_inputs.unsqueeze(0)
+
+
         for h_idx in range(h_grids):
             for w_idx in range(w_grids):
                 y1 = h_idx * h_stride
@@ -545,7 +534,22 @@ class SegEarthSegmentation(BaseSegmentor):
                 if any(pad):
                     crop_img = nn.functional.pad(crop_img, pad)
 
-                crop_seg_logit = self.forward_feature(crop_img)
+                # SAM
+                # ---- SAM 쪽 crop 좌표 (1024/512) ----
+                if sam_inputs is not None:
+                    sam_y1 = h_idx * sam_h_stride
+                    sam_x1 = w_idx * sam_w_stride
+                    sam_y2 = min(sam_y1 + sam_h_crop, H_sam)
+                    sam_x2 = min(sam_x1 + sam_w_crop, W_sam)
+                    sam_y1 = max(sam_y2 - sam_h_crop, 0)
+                    sam_x1 = max(sam_x2 - sam_w_crop, 0)
+                    sam_crop = sam_inputs[:, :, sam_y1:sam_y2, sam_x1:sam_x2]
+                    # SAM encoder는 1024×1024 고정 입력이므로 패딩 불필요
+                else:
+                    sam_crop = None
+
+
+                crop_seg_logit = self.forward_feature(crop_img, sam_crop)
 
                 # mask cutting for padded image
                 if any(pad):
@@ -566,7 +570,7 @@ class SegEarthSegmentation(BaseSegmentor):
         return logits
 
     @torch.no_grad()
-    def predict(self, inputs, data_samples):
+    def predict(self, inputs, sam_inputs=None, data_samples=None):
         if data_samples is not None:
             batch_img_metas = [
                 data_sample.metainfo for data_sample in data_samples
@@ -580,10 +584,11 @@ class SegEarthSegmentation(BaseSegmentor):
                                       padding_size=[0, 0, 0, 0])
                               ] * inputs.shape[0]
         inputs = inputs.half()
+        sam_inputs = sam_inputs.half()
         if self.slide_crop > 0:
-            seg_logits = self.forward_slide(inputs, batch_img_metas, self.slide_stride, self.slide_crop)
+            seg_logits = self.forward_slide(inputs, sam_inputs, batch_img_metas, self.slide_stride, self.slide_crop)
         else:
-            seg_logits = self.forward_feature(inputs, batch_img_metas[0]['ori_shape'])
+            seg_logits = self.forward_feature(inputs, sam_inputs, batch_img_metas[0]['ori_shape'])
 
         return self.postprocess_result(seg_logits, data_samples)
 

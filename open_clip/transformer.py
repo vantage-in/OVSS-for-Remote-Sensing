@@ -499,7 +499,7 @@ class VisionTransformer(nn.Module):
 
         return pooled, tokens
 
-    def forward(self, x: torch.Tensor, model_type: str = 'ClearCLIP', ignore_residual=True, output_cls_token=False, last_n_layers=1):
+    def forward(self, x: torch.Tensor, model_type: str = 'ClearCLIP', ex_feats : torch.tensor = None, ignore_residual=True, output_cls_token=False, last_n_layers=1, ref_dino = None, ref_clip = None):
         B, nc, w, h = x.shape
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
@@ -522,51 +522,75 @@ class VisionTransformer(nn.Module):
         for blk in self.transformer.resblocks[:-last_n_layers]:
             x = blk(x)
 
+        if ex_feats is not None:
+            ex_feats = ex_feats.flatten(2, 3)
+
         output = 0
-        for blk in self.transformer.resblocks[-last_n_layers:]:
-            if ignore_residual:
-                output += self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type)
 
-                x = blk(x)
-            else:
-                x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type)
-                x_out = x_out + blk.mlp(blk.ln_2(x_out))
-                output += x_out
+        if ref_dino is None:
+            for blk in self.transformer.resblocks[-last_n_layers:]:
+                if ignore_residual:
+                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type) # ex_feats added
 
-                x = blk(x)
+                    x = blk(x)
+                else:
+                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type)
+                    x_out = x_out + blk.mlp(blk.ln_2(x_out))
+                    output += x_out
+
+                    x = blk(x)
+        elif ref_dino is not None:
+            # Required: [1, 768, 784]
+            # ex_feats도 normalize를 해야 하나?
+            ex_feats = torch.cat([ex_feats, ref_dino], dim=-1)
+
+            for blk in self.transformer.resblocks[-last_n_layers:]:
+                if ignore_residual:
+                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip) # ex_feats added
+
+                    x = blk(x)
+                else:
+                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type, ref_v=ref_clip)
+                    x_out = x_out + blk.mlp(blk.ln_2(x_out))
+                    output += x_out
+            output = output[:784, :, :]
 
         x = output.permute(1, 0, 2)  # LND -> NLD
-
-        if self.attn_pool is not None:
-            if self.attn_pool_contrastive is not None:
-                # This is untested, WIP pooling that should match paper
-                x = self.ln_post(x)  # TBD LN first or separate one after each pool?
-                tokens = self.attn_pool(x)
-                if self.attn_pool_type == 'parallel':
-                    pooled = self.attn_pool_contrastive(x)
+        if ex_feats is not None:
+            x = self.ln_post(x)
+            x = x @ self.proj
+            return x
+        else:
+            if self.attn_pool is not None:
+                if self.attn_pool_contrastive is not None:
+                    # This is untested, WIP pooling that should match paper
+                    x = self.ln_post(x)  # TBD LN first or separate one after each pool?
+                    tokens = self.attn_pool(x)
+                    if self.attn_pool_type == 'parallel':
+                        pooled = self.attn_pool_contrastive(x)
+                    else:
+                        assert self.attn_pool_type == 'cascade'
+                        pooled = self.attn_pool_contrastive(tokens)
                 else:
-                    assert self.attn_pool_type == 'cascade'
-                    pooled = self.attn_pool_contrastive(tokens)
+                    # this is the original OpenCLIP CoCa setup, does not match paper
+                    x = self.attn_pool(x)
+                    x = self.ln_post(x)
+                    pooled, tokens = self._global_pool(x)
+            elif self.final_ln_after_pool:
+                pooled, tokens = self._global_pool(x)
+                pooled = self.ln_post(pooled)
             else:
-                # this is the original OpenCLIP CoCa setup, does not match paper
-                x = self.attn_pool(x)
                 x = self.ln_post(x)
                 pooled, tokens = self._global_pool(x)
-        elif self.final_ln_after_pool:
-            pooled, tokens = self._global_pool(x)
-            pooled = self.ln_post(pooled)
-        else:
-            x = self.ln_post(x)
-            pooled, tokens = self._global_pool(x)
 
-        if self.proj is not None:
-            pooled = pooled @ self.proj
-            tokens = tokens @ self.proj
+            if self.proj is not None:
+                pooled = pooled @ self.proj
+                tokens = tokens @ self.proj
 
-        if output_cls_token:
-            return pooled, tokens
-        
-        return tokens
+            if output_cls_token:
+                return pooled, tokens
+
+            return tokens
 
     def interpolate_pos_encoding(self, x, w, h):
         npatch = x.shape[1] - 1
@@ -613,19 +637,72 @@ class VisionTransformer(nn.Module):
             out = torch.hstack([torch.zeros((dim1 * dim2 + 1, 1)), v_adjusted])
         return out
     
-    def custom_attn(self, attn_layer, x, model_type='ClearCLIP'):
-
+    def custom_attn(self, attn_layer, x, ex_feats=None, model_type='ClearCLIP', ref_v=None):
         num_heads = attn_layer.num_heads
         num_tokens, bsz, embed_dim = x.size()
+        # if ref_v is not None:
+        #     num_tokens = num_tokens//2
         head_dim = embed_dim // num_heads
         scale = head_dim ** -0.5
+        H_tok = W_tok = int((num_tokens - 1) ** 0.5)
+        assert H_tok * W_tok == num_tokens - 1, "token grid is not square – handle here if needed"
+        
+        if ref_v is None:
+            q, k, v = F.linear(x, attn_layer.in_proj_weight, attn_layer.in_proj_bias).chunk(3, dim=-1)
+            q = q.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+            k = k.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+            v = v.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+            if ex_feats is not None:
+                v = v[:, 1:, :]
+        elif ref_v is not None:
+            q, k, v1 = F.linear(x, attn_layer.in_proj_weight, attn_layer.in_proj_bias).chunk(3, dim=-1)
+            v1 = v1[1:, :, :]
+            v1 = v1.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+            
+        if ex_feats is not None:
+            if ref_v is not None:
+                beta = 1.5
+            else:
+                beta = 1.2
+            gamma = 3.0
+            
+            # for featup
+            # ex_feats = F.interpolate(ex_feats, size=(H_tok, W_tok),
+            #                      mode='bilinear', align_corners=False)
 
-        q, k, v = F.linear(x, attn_layer.in_proj_weight, attn_layer.in_proj_bias).chunk(3, dim=-1)
-        q = q.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
-        k = k.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
-        v = v.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+            B, C, N = ex_feats.shape # [1, 768, 28, 28]
+            if ref_v is not None:
+                N = 784
+            H = W = int(np.sqrt(N))
 
-        if model_type == 'vanilla':
+            q_k = F.normalize(ex_feats, dim=1) # [1, 768, 784]
+            similarity = torch.einsum("b c m, b c n -> b m n", q_k, q_k) # [1, 784, 784]
+            
+            similarity = (similarity - torch.mean(similarity) * beta) * gamma
+            if ref_v is not None:
+                similarity[similarity < 0.0] = float('-inf')
+            else:
+                similarity[similarity < 0.0] = float('-inf')
+
+            mask = similarity.to(q.dtype).unsqueeze(1).repeat(1, num_heads, 1, 1)
+            mask = mask.reshape(bsz * num_heads, mask.shape[2], mask.shape[3])
+            attn_weights = F.softmax(mask, dim=-1) # [12, 784, 784]
+
+            if ref_v is None:
+                v = v.reshape(bsz*num_heads, H_tok, W_tok, head_dim).permute(0, 3, 1, 2) 
+                v = F.interpolate(v, size=(H, W), mode='bilinear', align_corners=False)
+                v = v.permute(0, 2, 3, 1).reshape(bsz*num_heads, H*W, head_dim)
+            else:
+                v1 = v1.reshape(bsz*num_heads, H_tok, W_tok, head_dim).permute(0, 3, 1, 2) 
+                v1 = F.interpolate(v1, size=(H, W), mode='bilinear', align_corners=False)
+                v1 = v1.permute(0, 2, 3, 1).reshape(bsz*num_heads, H*W, head_dim)
+                K = ref_v.shape[-1]
+                v2 = ref_v.reshape(bsz*num_heads, head_dim, K)
+                v2 = v2.permute(0, 2, 1).reshape(bsz*num_heads, K, head_dim)
+
+                v = torch.cat([v1, v2], dim=1).to(dtype=v1.dtype)
+
+        elif model_type == 'vanilla':
             qk_attn = torch.bmm(q, k.transpose(1, 2)) * scale
             attn_weights = F.softmax(qk_attn, dim=-1)
         elif model_type == 'MaskCLIP':
@@ -674,6 +751,189 @@ class VisionTransformer(nn.Module):
         attn_output = torch.bmm(attn_weights, v)
         attn_output = attn_output.transpose(0, 1).contiguous().view(-1, bsz, embed_dim)
         attn_output = attn_layer.out_proj(attn_output)
+
+        return attn_output
+
+    def forward_last_layer(self, x: torch.Tensor, last_n_layers=1):
+        B, nc, w, h = x.shape
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+
+        # class embeddings and positional embeddings
+        x = torch.cat([_expand_token(self.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
+        # shape = [*, grid ** 2 + 1, width]
+
+        if x.shape[1] != self.positional_embedding.shape[0]:
+            x = x + self.interpolate_pos_encoding(x, w, h).to(x.dtype)
+        else:
+            x = x + self.positional_embedding.to(x.dtype)
+
+        x = self.patch_dropout(x)
+        x = self.ln_pre(x)
+
+        x = x.permute(1, 0, 2)  # NLD -> LND
+
+        for blk in self.transformer.resblocks[:-last_n_layers]:
+            x = blk(x)
+
+        v = 0
+        for blk in self.transformer.resblocks[-last_n_layers:]:
+            x = blk.ln_1(x)
+
+            num_heads = blk.attn.num_heads
+            num_tokens, bsz, embed_dim = x.size()
+            head_dim = embed_dim // num_heads
+            scale = head_dim ** -0.5
+            H_tok = W_tok = int((num_tokens - 1) ** 0.5)
+            assert H_tok * W_tok == num_tokens - 1, "token grid is not square – handle here if needed"
+            
+            _, _, val = F.linear(x, blk.attn.in_proj_weight, blk.attn.in_proj_bias).chunk(3, dim=-1)
+            v += val
+            v = v[1:, :, :].contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+            v = v.reshape(bsz*num_heads, H_tok, W_tok, head_dim).permute(0, 3, 1, 2) 
+            v = F.interpolate(v, size=(28, 28), mode='bilinear', align_corners=False)
+
+        return v
+
+    def last_layer_input(self, x: torch.Tensor, last_n_layers=1):
+        B, nc, w, h = x.shape
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+
+        # class embeddings and positional embeddings
+        x = torch.cat([_expand_token(self.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
+        # shape = [*, grid ** 2 + 1, width]
+
+        if x.shape[1] != self.positional_embedding.shape[0]:
+            x = x + self.interpolate_pos_encoding(x, w, h).to(x.dtype)
+        else:
+            x = x + self.positional_embedding.to(x.dtype)
+
+        x = self.patch_dropout(x)
+        x = self.ln_pre(x)
+
+        x = x.permute(1, 0, 2)  # NLD -> LND
+
+        for blk in self.transformer.resblocks[:-last_n_layers]:
+            x = blk(x)
+
+        return x
+
+    def value_projection(self, x: torch.Tensor, last_n_layers=1):
+        v = 0
+        for blk in self.transformer.resblocks[-last_n_layers:]:
+            x = blk.ln_1(x)
+
+            num_heads = blk.attn.num_heads
+            num_tokens, bsz, embed_dim = x.size()
+            head_dim = embed_dim // num_heads
+            scale = head_dim ** -0.5
+            H_tok = W_tok = int((num_tokens - 1) ** 0.5)
+            assert H_tok * W_tok == num_tokens - 1, "token grid is not square – handle here if needed"
+            
+            _, _, val = F.linear(x, blk.attn.in_proj_weight, blk.attn.in_proj_bias).chunk(3, dim=-1)
+            v += val
+            v = v[1:, :, :].contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+            v = v.reshape(bsz*num_heads, H_tok, W_tok, head_dim).permute(0, 3, 1, 2) 
+            v = F.interpolate(v, size=(28, 28), mode='bilinear', align_corners=False)
+
+        return v
+
+    def forward_from_last_layer(self, x: torch.Tensor, model_type: str = 'ClearCLIP', ex_feats : torch.tensor = None, ignore_residual=True, output_cls_token=False, last_n_layers=1, ref_dino = None, ref_clip = None):
+
+        if ex_feats is not None:
+            ex_feats = ex_feats.flatten(2, 3)
+
+        output = 0
+        if ref_dino is None:
+            for blk in self.transformer.resblocks[-last_n_layers:]:
+                if ignore_residual:
+                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type) # ex_feats added
+
+                    x = blk(x)
+                else:
+                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type)
+                    x_out = x_out + blk.mlp(blk.ln_2(x_out))
+                    output += x_out
+
+                    x = blk(x)
+        elif ref_dino is not None:
+            # Required: [1, 768, 784]
+            # ex_feats도 normalize를 해야 하나?
+            ex_feats = torch.cat([ex_feats, ref_dino], dim=-1)
+
+            for blk in self.transformer.resblocks[-last_n_layers:]:
+                if ignore_residual:
+                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip) # ex_feats added
+
+                    x = blk(x)
+                else:
+                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type, ref_v=ref_clip)
+                    x_out = x_out + blk.mlp(blk.ln_2(x_out))
+                    output += x_out
+            output = output[:784, :, :]
+
+        x = output.permute(1, 0, 2)  # LND -> NLD
+        if ex_feats is not None:
+            x = self.ln_post(x)
+            x = x @ self.proj
+            return x
+        else:
+            if self.attn_pool is not None:
+                if self.attn_pool_contrastive is not None:
+                    # This is untested, WIP pooling that should match paper
+                    x = self.ln_post(x)  # TBD LN first or separate one after each pool?
+                    tokens = self.attn_pool(x)
+                    if self.attn_pool_type == 'parallel':
+                        pooled = self.attn_pool_contrastive(x)
+                    else:
+                        assert self.attn_pool_type == 'cascade'
+                        pooled = self.attn_pool_contrastive(tokens)
+                else:
+                    # this is the original OpenCLIP CoCa setup, does not match paper
+                    x = self.attn_pool(x)
+                    x = self.ln_post(x)
+                    pooled, tokens = self._global_pool(x)
+            elif self.final_ln_after_pool:
+                pooled, tokens = self._global_pool(x)
+                pooled = self.ln_post(pooled)
+            else:
+                x = self.ln_post(x)
+                pooled, tokens = self._global_pool(x)
+
+            if self.proj is not None:
+                pooled = pooled @ self.proj
+                tokens = tokens @ self.proj
+
+            if output_cls_token:
+                return pooled, tokens
+
+            return tokens
+        
+    # for cdam
+    def custom_dual_attn(self, attn_layer, x, weight=None, return_attn=False, with_attn=False, csa=False):
+        
+        num_heads = attn_layer.num_heads
+        _, bsz, embed_dim = x.size()
+        head_dim = embed_dim // num_heads
+        scale = head_dim ** -0.5
+
+        q, k, v = F.linear(x, attn_layer.in_proj_weight, attn_layer.in_proj_bias).chunk(3, dim=-1)
+        q = q.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+        k = k.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+        v = v.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+
+    
+        if weight == None:
+            attn_output = v.transpose(0, 1).contiguous().view(-1, bsz, embed_dim)
+        else:
+            attn_output = torch.bmm(weight, v).transpose(0, 1).contiguous().view(-1, bsz, embed_dim)
+        attn_output = attn_layer.out_proj(attn_output)
+        
+        if with_attn:
+            return attn_output, attn_weights
 
         return attn_output
 

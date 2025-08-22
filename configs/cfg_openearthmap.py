@@ -3,16 +3,19 @@ _base_ = './base_config.py'
 # model settings
 model = dict(
     name_path='./configs/cls_openearthmap.txt',
-    prob_thd=0.1,
+    prob_thd=0.1
 )
 
 # dataset settings
 dataset_type = 'OpenEarthMapDataset'
 data_root = ''
 
+# custom_imports = dict(imports=['variants'], allow_failed_imports=False)
+
 test_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='Resize', scale=(448, 448), keep_ratio=True),
+    #dict(type='GaussianNoiseVariant', std=20.0),
     # add loading annotation after ``Resize`` because ground truth
     # does not need to do resize data transform
     dict(type='LoadAnnotations'),

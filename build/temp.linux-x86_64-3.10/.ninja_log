@@ -1,0 +1,4 @@
+# ninja log v5
+1	16320	1753628583000000000	/home/icl_intern1/SegEarth-OV/build/temp.linux-x86_64-3.10/featup/adaptive_conv_cuda/adaptive_conv_cuda.o	18e5430cc278df9a
+1	53415	1753628620000000000	/home/icl_intern1/SegEarth-OV/build/temp.linux-x86_64-3.10/featup/adaptive_conv_cuda/adaptive_conv_kernel.o	edf25426446e004a
+0	15501	1753628636000000000	/home/icl_intern1/SegEarth-OV/build/temp.linux-x86_64-3.10/featup/adaptive_conv_cuda/adaptive_conv.o	8b79b7b15d0d53c9

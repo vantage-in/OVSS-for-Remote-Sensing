@@ -324,6 +324,24 @@ class JBUOne(torch.nn.Module):
         source_16 = self.upsample(source_8, guidance, self.up)
         return self.fixup_proj(source_16) * 0.1 + source_16
 
+    def up2(self, source, guidance):
+        source_2 = self.upsample(source, guidance, self.up)
+        return source_2
+    
+    def up4(self, source_2, guidance):
+        source_4 = self.upsample(source_2, guidance, self.up)
+        return source_4
+
+    def up8(self, source_4, guidance):
+        source_8 = self.upsample(source_4, guidance, self.up)
+        return source_8
+
+    def up16(self, source_8, guidance):
+        source_16 = self.upsample(source_8, guidance, self.up)
+        return source_16
+
+    def fixup(self, source_16):
+        return self.fixup_proj(source_16) * 0.1 + source_16
 
 class LayerNorm2d(nn.Module):
     def __init__(self, num_channels: int, eps: float = 1e-6) -> None:

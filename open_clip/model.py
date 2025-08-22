@@ -267,13 +267,37 @@ class CLIP(nn.Module):
                      model_type,
                      ignore_residual: bool = False,
                      output_cls_token: bool = False,
+                     ex_feats: torch.tensor = None,
+                     ref_dino: torch.tensor = None,
+                     ref_clip: torch.tensor = None,
                      normalize: bool = False):
-        features = self.visual(image, model_type, ignore_residual, output_cls_token)
+        features = self.visual(image, model_type, ex_feats, ignore_residual, output_cls_token, ref_dino=ref_dino, ref_clip=ref_clip)
         if output_cls_token:
             cls_token, features = features
             return F.normalize(cls_token, dim=-1) if normalize else cls_token, \
                 F.normalize(features, dim=-1) if normalize else features
         return F.normalize(features, dim=-1) if normalize else features
+
+    def encode_last_layer(self, image):
+        # Return value projection
+        return self.visual.forward_last_layer(image)
+
+    def encode_before_last_layer(self, image):
+        # Return the input of the last layer
+        return self.visual.last_layer_input(image)
+
+    def encode_value_projection(self, x):
+        return self.visual.value_projection(x)
+
+    def encode_from_last_layer(self,
+                     image,
+                     model_type,
+                     ignore_residual: bool = False,
+                     output_cls_token: bool = False,
+                     ex_feats: torch.tensor = None,
+                     ref_dino: torch.tensor = None,
+                     ref_clip: torch.tensor = None):
+        return self.visual.forward_from_last_layer(image, model_type, ex_feats, ignore_residual, output_cls_token, ref_dino=ref_dino, ref_clip=ref_clip)
 
     def encode_text(self, text, normalize: bool = False):
         cast_dtype = self.transformer.get_cast_dtype()

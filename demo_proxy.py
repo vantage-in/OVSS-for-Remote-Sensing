@@ -2,13 +2,15 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from torchvision import transforms
 from segearth_segmentor import SegEarthSegmentation
+# from proxy_segearth_segmentor import ProxySegEarthSegmentation
+from proxy_segearth_segmentor_cat import ProxySegEarthSegmentationCat   
 import numpy as np
 import matplotlib.colors as mcolors
 from pathlib import Path
 import matplotlib.patches as mpatches
 import torch
 
-img_path = 'demo/image/zanzibar_125.tif'
+img_path = 'demo/image/santiago_1.tif'
 img = Image.open(img_path)
 base_name = Path(img_path).stem  # 'kyoto_33'
 
@@ -27,12 +29,22 @@ writers.close()
 img_tensor = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
-    transforms.Resize((224, 224))
+    transforms.Resize((448, 448))
 ])(img)
 
 img_tensor = img_tensor.unsqueeze(0).to('cuda')
+# img_tensor = torch.rot90(img_tensor, k=2, dims=(2,3))
 
-model = SegEarthSegmentation(
+# ----------- SAM preprocess ------------
+sam_mean = [123.675/255.0, 116.28/255.0, 103.53/255.0]   # RGB, 0-1 스케일
+sam_std  = [58.395/255.0, 57.12/255.0, 57.375/255.0]
+img_sam = transforms.Compose([
+    transforms.ToTensor(),                                # (H,W,C)[0-255] → (C,H,W)[0-1]
+    transforms.Normalize(sam_mean, sam_std),              # SAM 백본 통계
+    transforms.Resize((2048, 2048))                       # SAM ViT-B/L 기본 해상도
+])(img)
+
+model = ProxySegEarthSegmentationCat(
     clip_type='CLIP',     # 'CLIP', 'BLIP', 'OpenCLIP', 'MetaCLIP', 'ALIP', 'SkyCLIP', 'GeoRSCLIP', 'RemoteCLIP'
     vit_type='ViT-B/16',      # 'ViT-B/16', 'ViT-L-14'
     model_type='SegEarth',   # 'vanilla', 'MaskCLIP', 'GEM', 'SCLIP', 'ClearCLIP', 'SegEarth'
@@ -45,10 +57,27 @@ model = SegEarthSegmentation(
     name_path='./configs/my_name.txt',
     prob_thd=0.1,
     cls_variant="none",
-    slide_crop = 0
+    vfm_model="dino"
 )
+# model = SamProxySegEarthSegmentation(
+#     clip_type='CLIP',     # 'CLIP', 'BLIP', 'OpenCLIP', 'MetaCLIP', 'ALIP', 'SkyCLIP', 'GeoRSCLIP', 'RemoteCLIP'
+#     vit_type='ViT-B/16',      # 'ViT-B/16', 'ViT-L-14'
+#     model_type='SegEarth',   # 'vanilla', 'MaskCLIP', 'GEM', 'SCLIP', 'ClearCLIP', 'SegEarth'
+#     ignore_residual=True,
+#     feature_up=True,
+#     feature_up_cfg=dict(
+#         model_name='jbu_one',
+#         model_path='simfeatup_dev/weights/xclip_jbu_one_million_aid.ckpt'),
+#     cls_token_lambda=-0.3,
+#     name_path='./configs/my_name.txt',
+#     prob_thd=0.1,
+#     cls_variant="none",
+#     vfm_model="sam"
+# )
 
 seg_pred = model.predict(img_tensor, data_samples=None)
+# seg_pred = torch.rot90(seg_pred, k=2, dims=(1,2))
+#seg_pred = model.predict(img_tensor, img_sam, data_samples=None)
 #seg_mask = seg_pred.data.cpu().numpy().squeeze(0)
 seg_mask = seg_pred.data.cpu().numpy().squeeze(0).astype(np.uint8)
 
@@ -170,23 +199,23 @@ def save_overlay_with_legend(img, seg_mask, filename, name_list):
     
 # === 8. Save the outputs ===
 if model.feature_up:
-    pred_path = Path("visualize/prediction") / f"0812_{base_name}_pred.png"
-    overlay_path = Path("visualize/prediction") / f"0812_{base_name}_pred_overlay.png"
+    pred_path = Path("visualize/cat") / f"0820_{base_name}_pred.png"
+    overlay_path = Path("visualize/cat") / f"0820_{base_name}_pred_overlay.png"
 else:
-    pred_path = Path("visualize/prediction") / f"0812_{base_name}_no_pred.png"
-    overlay_path = Path("visualize/prediction") / f"0812_{base_name}_no_pred_overlay.png"
+    pred_path = Path("visualize/prediction") / f"08132_{base_name}_no_pred.png"
+    overlay_path = Path("visualize/prediction") / f"08132_{base_name}_no_pred_overlay.png"
 
 save_mask_with_legend(
     seg_mask,
     filename=str(pred_path),
     title=f"OpenEarthMap - {base_name}"
 )
-save_overlay_with_legend(
-    img,
-    seg_mask,
-    filename=f"visualize/prediction/0812_{base_name}_pred_overlay.png",
-    name_list=name_list
-)
+# save_overlay_with_legend(
+#     img,
+#     seg_mask,
+#     filename=str(overlay_path),
+#     name_list=name_list
+# )
 # save_overlay(
 #     img,
 #     seg_mask,

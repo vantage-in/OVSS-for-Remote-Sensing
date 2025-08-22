@@ -1,0 +1,24 @@
+ninja_required_version = 1.3
+cxx = c++
+
+cflags = -pthread -B /home/icl_intern1/.conda/envs/Segearth/compiler_compat -Wno-unused-result -Wsign-compare -DNDEBUG -O2 -Wall -fPIC -O2 -isystem /home/icl_intern1/.conda/envs/Segearth/include -I/home/icl_intern1/.conda/envs/Segearth/include -fPIC -O2 -isystem /home/icl_intern1/.conda/envs/Segearth/include -fPIC -UNDEBUG -I/home/icl_intern1/.conda/envs/Segearth/lib/python3.9/site-packages/torch/include -I/home/icl_intern1/.conda/envs/Segearth/lib/python3.9/site-packages/torch/include/torch/csrc/api/include -I/home/icl_intern1/.conda/envs/Segearth/lib/python3.9/site-packages/torch/include/TH -I/home/icl_intern1/.conda/envs/Segearth/lib/python3.9/site-packages/torch/include/THC -I/home/icl_intern1/.conda/envs/Segearth/include/python3.9 -c
+post_cflags = -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=adaptive_conv_cpp_impl -D_GLIBCXX_USE_CXX11_ABI=0 -std=c++17
+cuda_dlink_post_cflags = 
+ldflags = 
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+
+
+
+
+build /home/icl_intern1/SegEarth-OV/build/temp.linux-x86_64-3.9/featup/adaptive_conv_cuda/adaptive_conv.o: compile /home/icl_intern1/SegEarth-OV/featup/adaptive_conv_cuda/adaptive_conv.cpp
+
+
+
+
+
+
