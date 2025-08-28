@@ -320,66 +320,6 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         else:
             logits = nn.functional.interpolate(logits, size=logit_size, mode='bilinear')
 
-        smoothing = False
-        if smoothing:
-            seg_logits_item = logits[0]
-            device = seg_logits_item.device
-
-            k = 4
-            h = k**2 + 2 * k  
-            window_size = 2 * k + 1  
-            C, H, W = seg_logits_item.shape
-
-            # 1. logit -> probs for JSD
-            probs = (seg_logits_item * self.logit_scale).softmax(dim=0)
-
-            # 2. unfold 함수로 슬라이딩 윈도우 생성 (확률 및 로짓 모두)
-            padding = k  # 이미지 경계 처리를 위한 패딩
-            prob_patches = F.unfold(
-                probs.unsqueeze(0),
-                kernel_size=window_size,
-                padding=padding
-            ).squeeze(0)
-            # [C, 윈도우크기*윈도우크기, H*W] 형태로 변경
-            prob_patches = prob_patches.view(C, window_size**2, H * W)
-
-            logit_patches = F.unfold(
-                seg_logits_item.unsqueeze(0),
-                kernel_size=window_size,
-                padding=padding
-            ).squeeze(0)
-            logit_patches = logit_patches.view(C, window_size**2, H * W)
-
-            # 3. 중심 픽셀과 이웃 픽셀 간의 JSD 계산
-            center_probs = probs.view(C, H * W).unsqueeze(1).expand(-1, window_size**2, -1)
-            
-            m = 0.5 * (center_probs + prob_patches)
-            eps = 1e-10  # log(0) 방지를 위한 작은 값
-
-            # F.kl_div(input, target)은 D_KL(target || input)을 계산하며, input으로 log-prob를 기대함
-            log_m = torch.log(m + eps)
-            jsd_scores = 0.5 * (
-                F.kl_div(log_m, center_probs, reduction='none', log_target=False).sum(dim=0) +
-                F.kl_div(log_m, prob_patches, reduction='none', log_target=False).sum(dim=0)
-            )
-            # jsd_scores의 최종 shape: [윈도우크기*윈도우크기, H*W]
-
-            # 4. JSD가 가장 낮은 (가장 유사한) 상위 h개 이웃 선택
-            top_h_indices = torch.topk(jsd_scores, h, dim=0, largest=False).indices
-            # top_h_indices의 shape: [h, H*W]
-
-            # 5. 선택된 이웃들의 원본 로짓을 가져오기
-            expanded_indices = top_h_indices.unsqueeze(0).expand(C, -1, -1)
-            selected_logits = torch.gather(logit_patches, 1, expanded_indices)
-            # selected_logits의 shape: [C, h, H*W]
-
-            # 6. 선택된 로짓들의 평균을 계산하여 새로운 로짓으로 사용
-            averaged_logits = selected_logits.mean(dim=1)
-            smoothed_logits = averaged_logits.view(C, H, W)
-            # --- JSD 스무딩 로직 종료 ---
-
-            logits = smoothed_logits.unsqueeze(0)
-
         return logits
 
     def ref_feature_dino(self, img, logit_size=None):
