@@ -1,21 +1,6 @@
 # # base configurations
-model = dict(
-    type='SegEarthSegmentation',
-    clip_type='CLIP',     # 'CLIP', 'BLIP', 'OpenCLIP', 'MetaCLIP', 'ALIP', 'SkyCLIP', 'GeoRSCLIP', 'RemoteCLIP'
-    vit_type='ViT-B/16',      # 'ViT-B/16', 'ViT-L-14'
-    model_type='SegEarth',   # 'vanilla', 'MaskCLIP', 'GEM', 'SCLIP', 'ClearCLIP', 'SegEarth'
-    ignore_residual=True,
-    feature_up=True,
-    feature_up_cfg=dict(
-        model_name='jbu_one',
-        model_path='simfeatup_dev/weights/xclip_jbu_one_million_aid.ckpt'),
-    cls_token_lambda=-0.3,
-    cls_variant="none"
-)
-# custom_imports = dict(imports=['proxy_segearth_segmentor_cat'], allow_failed_imports=False)
-
 # model = dict(
-#     type='ProxySegEarthSegmentationCat',
+#     type='SegEarthSegmentation',
 #     clip_type='CLIP',     # 'CLIP', 'BLIP', 'OpenCLIP', 'MetaCLIP', 'ALIP', 'SkyCLIP', 'GeoRSCLIP', 'RemoteCLIP'
 #     vit_type='ViT-B/16',      # 'ViT-B/16', 'ViT-L-14'
 #     model_type='SegEarth',   # 'vanilla', 'MaskCLIP', 'GEM', 'SCLIP', 'ClearCLIP', 'SegEarth'
@@ -25,9 +10,24 @@ model = dict(
 #         model_name='jbu_one',
 #         model_path='simfeatup_dev/weights/xclip_jbu_one_million_aid.ckpt'),
 #     cls_token_lambda=-0.3,
-#     cls_variant="none",
-#     vfm_model="dino"
+#     cls_variant="none"
 # )
+custom_imports = dict(imports=['proxy_segearth_segmentor_cat_random'], allow_failed_imports=False)
+
+model = dict(
+    type='ProxySegEarthSegmentationCatRandom',
+    clip_type='CLIP',     # 'CLIP', 'BLIP', 'OpenCLIP', 'MetaCLIP', 'ALIP', 'SkyCLIP', 'GeoRSCLIP', 'RemoteCLIP'
+    vit_type='ViT-B/16',      # 'ViT-B/16', 'ViT-L-14'
+    model_type='SegEarth',   # 'vanilla', 'MaskCLIP', 'GEM', 'SCLIP', 'ClearCLIP', 'SegEarth'
+    ignore_residual=True,
+    feature_up=True,
+    feature_up_cfg=dict(
+        model_name='jbu_one',
+        model_path='simfeatup_dev/weights/xclip_jbu_one_million_aid.ckpt'),
+    cls_token_lambda=-0.3,
+    cls_variant="none",
+    vfm_model="dino"
+)
 
 test_evaluator = dict(type='IoUMetric', iou_metrics=['mIoU'])
 

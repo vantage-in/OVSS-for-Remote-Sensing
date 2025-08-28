@@ -25,7 +25,8 @@ import numpy as np
 
 from myutils import UnNormalize
 from segment_anything import sam_model_registry
-from sklearn.cluster import KMeans
+# from sklearn.cluster import KMeans
+from fast_pytorch_kmeans import KMeans
 import torchvision.transforms.functional as TF
 
 @MODELS.register_module()
@@ -335,11 +336,12 @@ class ProxySegEarthSegmentationCat(BaseSegmentor):
             feat_out = {}
             def hook_fn_forward_qkv(module, input, output):
                 feat_out["qkv"] = output
-            self.vfm._modules["blocks"][-1]._modules["attn"]._modules["qkv"].register_forward_hook(
+            handle = self.vfm._modules["blocks"][-1]._modules["attn"]._modules["qkv"].register_forward_hook(
                 hook_fn_forward_qkv)
 
             # Forward pass in the model
             feat = self.vfm.get_intermediate_layers(imgs_norm)[0]
+            handle.remove()
 
             nb_im = feat.shape[0]  # Batch size
             nb_tokens = feat.shape[1]  # Number of tokens
@@ -399,11 +401,12 @@ class ProxySegEarthSegmentationCat(BaseSegmentor):
             feat_out = {}
             def hook_fn_forward_qkv(module, input, output):
                 feat_out["qkv"] = output
-            self.vfm._modules["blocks"][-1]._modules["attn"]._modules["qkv"].register_forward_hook(
+            handle = self.vfm._modules["blocks"][-1]._modules["attn"]._modules["qkv"].register_forward_hook(
                 hook_fn_forward_qkv)
 
             # Forward pass in the model
             feat = self.vfm.get_intermediate_layers(imgs_norm)[0]
+            handle.remove()
 
             nb_im = feat.shape[0]  # Batch size
             nb_tokens = feat.shape[1]  # Number of tokens
@@ -1381,8 +1384,6 @@ class ProxySegEarthSegmentationCat(BaseSegmentor):
         total_feature_patches = 0
         patch_counter = 0
 
-        # pred_map_global_scaled = self._get_upscaled_global_pred_map(img)
-
         for h_idx in range(h_grids):
             for w_idx in range(w_grids):
                 # ... (crop_img 생성 및 강건성 마스크 계산 로직은 동일) ...
@@ -1391,39 +1392,15 @@ class ProxySegEarthSegmentationCat(BaseSegmentor):
                 y1, x1 = max(y2 - h_crop, 0), max(x2 - w_crop, 0)
                 crop_img = img[:, :, y1:y2, x1:x2]
 
-                pred_map_0 = self._predict_feature_map(crop_img)
-                H_feat, W_feat = pred_map_0.shape
-                total_feature_patches += H_feat * W_feat
+                dino_feat, clip_feat = self.ref_feature(crop_img)
+                dino_feat_flat = dino_feat.flatten(2, 3).permute(0, 2, 1).reshape(-1, dino_feat.shape[1])
+                clip_feat_flat = clip_feat.flatten(2, 3).permute(2, 0, 1).reshape(-1, clip_feat.shape[0] * clip_feat.shape[1])
 
-                pred_map_90 = torch.rot90(self._predict_feature_map(TF.rotate(crop_img, 90)), k=-1, dims=(0, 1))
-                pred_map_180 = torch.rot90(self._predict_feature_map(TF.rotate(crop_img, 180)), k=-2, dims=(0, 1))
-                pred_map_270 = torch.rot90(self._predict_feature_map(TF.rotate(crop_img, 270)), k=-3, dims=(0, 1))
+                all_robust_dino.append(dino_feat_flat)
+                all_robust_clip.append(clip_feat_flat)
 
-                # y1_feat, x1_feat = y1 // self.dino_patch_size, x1 // self.dino_patch_size
-                # y2_feat, x2_feat = y1_feat + H_feat, x1_feat + W_feat
-                # pred_map_scale_crop = pred_map_global_scaled[y1_feat:y2_feat, x1_feat:x2_feat]
-
-                robustness_mask = (pred_map_0 == pred_map_90) & (pred_map_0 == pred_map_180) & \
-                                  (pred_map_0 == pred_map_270) #& (pred_map_0 == pred_map_scale_crop)
-                
-                # no augmentation
-                # robustness_mask = (pred_map_0 == pred_map_0)
-
-                if robustness_mask.sum() > 0:
-                    dino_feat, clip_feat = self.ref_feature(crop_img)
-                    # dino_feat, clip_feat = self._get_ensembled_features(crop_img)
-
-                    dino_feat_flat = dino_feat.flatten(2, 3).permute(0, 2, 1).reshape(-1, dino_feat.shape[1])
-                    clip_feat_flat = clip_feat.flatten(2, 3).permute(2, 0, 1).reshape(-1, clip_feat.shape[0] * clip_feat.shape[1])
-                    mask_flat = robustness_mask.flatten()
-                    
-                    robust_dino_feats_patch = dino_feat_flat[mask_flat]
-                    all_robust_dino.append(robust_dino_feats_patch)
-                    all_robust_clip.append(clip_feat_flat[mask_flat])
-
-                    # [추가] 이 강건한 피처들이 현재 패치(patch_counter) 소속임을 기록
-                    num_robust_in_patch = robust_dino_feats_patch.shape[0]
-                    all_robust_patch_ids.append(torch.full((num_robust_in_patch,), patch_counter, device=device))
+                num_robust_in_patch = dino_feat_flat.shape[0]
+                all_robust_patch_ids.append(torch.full((num_robust_in_patch,), patch_counter, device=device))
 
                 patch_counter += 1
         
@@ -1464,9 +1441,11 @@ class ProxySegEarthSegmentationCat(BaseSegmentor):
                     # --- 2. 외부 정보 풀에 대해 K-means 및 샘플링 수행 ---
                     K = 25
                     K = min(K, num_external_robust)
-                    kmeans = KMeans(n_clusters=K, init="k-means++", n_init=1, max_iter=25, random_state=42)
-                    labels = torch.tensor(kmeans.fit_predict(external_dino_feats.cpu().numpy()), device=device, dtype=torch.long)
-                    
+                    # kmeans = KMeans(n_clusters=K, init="k-means++", n_init=1, max_iter=25, random_state=42)
+                    # labels = torch.tensor(kmeans.fit_predict(external_dino_feats.cpu().numpy()), device=device, dtype=torch.long)
+                    kmeans = KMeans(n_clusters=K, init_method="kmeans++", mode="cosine", max_iter=25)
+                    labels = kmeans.fit_predict(external_dino_feats)
+
                     M = 80
                     dino_samples, clip_samples = [], []
                     for cid in range(K):
@@ -1499,24 +1478,8 @@ class ProxySegEarthSegmentationCat(BaseSegmentor):
                 else:
                     padded_crop_img = crop_img
 
-                # crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip)
+                crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip)
 
-                logit_0 = self.forward_feature(padded_crop_img, ref_dino, ref_clip)
-                # 90도
-                img_90 = TF.rotate(padded_crop_img, 90)
-                logit_90_raw = self.forward_feature(img_90, ref_dino, ref_clip)
-                logit_90 = torch.rot90(logit_90_raw, k=-1, dims=(2, 3)) # 결과 복원
-                # 180도
-                img_180 = TF.rotate(padded_crop_img, 180)
-                logit_180_raw = self.forward_feature(img_180, ref_dino, ref_clip)
-                logit_180 = torch.rot90(logit_180_raw, k=-2, dims=(2, 3)) # 결과 복원
-                # 270도
-                img_270 = TF.rotate(padded_crop_img, 270)
-                logit_270_raw = self.forward_feature(img_270, ref_dino, ref_clip)
-                logit_270 = torch.rot90(logit_270_raw, k=-3, dims=(2, 3)) # 결과 복원
-                # 4개 logit을 평균내어 최종 앙상블 logit 생성
-                crop_seg_logit = torch.stack([logit_0, logit_90, logit_180, logit_270], dim=0).mean(dim=0)
- 
                 # --- 예측 결과에서 패딩 제거 ---
                 if any(pad):
                     l, _, t, _ = pad

@@ -661,7 +661,7 @@ class VisionTransformer(nn.Module):
             
         if ex_feats is not None:
             if ref_v is not None:
-                beta = 1.5
+                beta = 1.5 # Openearthmap
             else:
                 beta = 1.2
             gamma = 3.0

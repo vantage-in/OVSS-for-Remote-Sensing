@@ -769,9 +769,9 @@ class ProxySegEarthSegmentation(BaseSegmentor):
         if self.slide_crop > 0:
             seg_logits = self.forward_slide(inputs, batch_img_metas, self.slide_stride, self.slide_crop)
 
-            resized_inputs = F.interpolate(inputs, size=(self.slide_crop, self.slide_crop), mode='bilinear', align_corners=False)
-            seg_logits_global = self.forward_feature(resized_inputs, logit_size=batch_img_metas[0]['ori_shape'])
-            seg_logits = (seg_logits + seg_logits_global) / 2.0
+            # resized_inputs = F.interpolate(inputs, size=(self.slide_crop, self.slide_crop), mode='bilinear', align_corners=False)
+            # seg_logits_global = self.forward_feature(resized_inputs, logit_size=batch_img_metas[0]['ori_shape'])
+            # seg_logits = (seg_logits + seg_logits_global) / 2.0
         else:
             seg_logits = self.forward_feature(inputs, batch_img_metas[0]['ori_shape'])
 
