@@ -413,6 +413,7 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         [수정됨] 각 슬라이딩 패치에 대해 '자신을 제외한' 외부 정보로 클러스터링 및 샘플링 수행
         """
         printing = False
+        _global = False
 
         if type(img) == list:
             img = img[0].unsqueeze(0)
@@ -428,6 +429,26 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         w_grids = max(w_img - w_crop + w_stride - 1, 0) // w_stride + 1
         device = img.device
         
+        # ========================================================================
+        # Phase 0: 이미지 전체의 '글로벌 뷰' 피처 추출
+        # ========================================================================
+        if _global:
+            if printing: print("Phase 0: Extracting global context features...")
+            with torch.no_grad():
+                global_view_img = F.interpolate(img, size=(224, 224), mode='bilinear', align_corners=False)
+                
+                x_global = self.net.encode_before_last_layer(global_view_img)
+                global_dino_feats = self.ref_feature_dino(global_view_img)
+                global_clip_feats = self.net.encode_value_projection(x_global)
+
+                global_dino_feats_flat = global_dino_feats.flatten(2, 3).permute(0, 2, 1).reshape(-1, global_dino_feats.shape[1])
+                global_clip_feats_flat = global_clip_feats.flatten(2, 3).permute(2, 0, 1).reshape(-1, global_clip_feats.shape[0] * global_clip_feats.shape[1])
+                
+                global_dino_feats_flat = global_dino_feats_flat.to(dtype=torch.float32)
+                global_clip_feats_flat = global_clip_feats_flat.to(dtype=torch.float32)
+                if printing: print(f"  - Extracted {global_dino_feats_flat.shape[0]} global feature pairs.")
+
+
         # ========================================================================
         # Phase 1: 강건한(Robust) 개별 피처 임베딩 및 '패치 ID' 수집
         # ========================================================================
@@ -548,9 +569,25 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                         dino_samples.append(external_dino_feats[rand_indices])
                         clip_samples.append(external_clip_feats[rand_indices])
                     
-                    if dino_samples:
-                        ref_dino = torch.cat(dino_samples, dim=0).t().unsqueeze(0).contiguous()
-                        ref_clip = torch.cat(clip_samples, dim=0).view(-1, 12, 64).permute(1, 2, 0).contiguous()
+                if dino_samples:
+                    sampled_dino = torch.cat(dino_samples, dim=0)
+                    sampled_clip = torch.cat(clip_samples, dim=0)
+                    
+                    if _global:
+                        final_ref_dino = torch.cat([sampled_dino, global_dino_feats_flat], dim=0)
+                        final_ref_clip = torch.cat([sampled_clip, global_clip_feats_flat], dim=0)
+                    else:
+                        final_ref_dino = sampled_dino
+                        final_ref_clip = sampled_clip
+                else:
+                    # 샘플링할 패치가 없는 경우, 글로벌 정보만 사용
+                    final_ref_dino = global_dino_feats_flat
+                    final_ref_clip = global_clip_feats_flat
+
+                if final_ref_dino.shape[0] > 0:
+                    ref_dino = final_ref_dino.t().unsqueeze(0).contiguous()
+                    ref_clip = final_ref_clip.view(-1, 12, 64).permute(1, 2, 0).contiguous()
+
 
                 # --- 3. 최종 예측 수행 ---
                 y1, x1 = h_idx * h_stride, w_idx * w_stride

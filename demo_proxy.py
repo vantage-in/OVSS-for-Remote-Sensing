@@ -2,16 +2,16 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from torchvision import transforms
 # from segearth_segmentor import SegEarthSegmentation
-from proxy_segearth_segmentor import ProxySegEarthSegmentation
+# from proxy_segearth_segmentor import ProxySegEarthSegmentation
 # from proxy_segearth_segmentor_cat import ProxySegEarthSegmentationCat   
-# from proxy_segearth_segmentor_cat_random import ProxySegEarthSegmentationCatRandom   
+from proxy_segearth_segmentor_cat_random import ProxySegEarthSegmentationCatRandom   
 import numpy as np
 import matplotlib.colors as mcolors
 from pathlib import Path
 import matplotlib.patches as mpatches
 import torch
 
-img_path = 'demo/image/kyoto_33.tif'
+img_path = 'demo/image/zanzibar_125.tif'
 img = Image.open(img_path)
 base_name = Path(img_path).stem  # 'kyoto_33'
 
@@ -45,7 +45,7 @@ img_sam = transforms.Compose([
     transforms.Resize((2048, 2048))                       # SAM ViT-B/L 기본 해상도
 ])(img)
 
-model = ProxySegEarthSegmentation(
+model = ProxySegEarthSegmentationCatRandom(
     clip_type='CLIP',     # 'CLIP', 'BLIP', 'OpenCLIP', 'MetaCLIP', 'ALIP', 'SkyCLIP', 'GeoRSCLIP', 'RemoteCLIP'
     vit_type='ViT-B/16',      # 'ViT-B/16', 'ViT-L-14'
     model_type='SegEarth',   # 'vanilla', 'MaskCLIP', 'GEM', 'SCLIP', 'ClearCLIP', 'SegEarth'
@@ -200,7 +200,7 @@ def save_overlay_with_legend(img, seg_mask, filename, name_list):
     
 # === 8. Save the outputs ===
 if model.feature_up:
-    pred_path = Path("visualize/cat") / f"0824_{base_name}_pred.png"
+    pred_path = Path("visualize/global") / f"0824_12_{base_name}_pred.png"
     overlay_path = Path("visualize/cat") / f"0822_{base_name}_pred_overlay.png"
 else:
     pred_path = Path("visualize/prediction") / f"08132_{base_name}_no_pred.png"
