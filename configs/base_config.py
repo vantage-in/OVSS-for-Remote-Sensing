@@ -12,10 +12,10 @@
 #     cls_token_lambda=-0.3,
 #     cls_variant="none"
 # )
-# custom_imports = dict(imports=['proxy_segearth_segmentor_cat_random'], allow_failed_imports=False)
+custom_imports = dict(imports=['proxy_segearth_segmentor_cat_random'], allow_failed_imports=False)
 
 model = dict(
-    type='ProxySegEarthSegmentation',
+    type='ProxySegEarthSegmentationCatRandom',
     clip_type='CLIP',     # 'CLIP', 'BLIP', 'OpenCLIP', 'MetaCLIP', 'ALIP', 'SkyCLIP', 'GeoRSCLIP', 'RemoteCLIP'
     vit_type='ViT-B/16',      # 'ViT-B/16', 'ViT-L-14'
     model_type='SegEarth',   # 'vanilla', 'MaskCLIP', 'GEM', 'SCLIP', 'ClearCLIP', 'SegEarth'
