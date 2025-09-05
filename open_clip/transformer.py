@@ -645,7 +645,7 @@ class VisionTransformer(nn.Module):
         head_dim = embed_dim // num_heads
         scale = head_dim ** -0.5
         H_tok = W_tok = int((num_tokens - 1) ** 0.5)
-        assert H_tok * W_tok == num_tokens - 1, "token grid is not square – handle here if needed"
+        assert H_tok * W_tok == num_tokens - 1, f"token grid is not square {num_tokens} – handle here if needed"
         
         if ref_v is None:
             q, k, v = F.linear(x, attn_layer.in_proj_weight, attn_layer.in_proj_bias).chunk(3, dim=-1)
