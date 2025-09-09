@@ -27,6 +27,7 @@ from myutils import UnNormalize
 from segment_anything import sam_model_registry
 # from sklearn.cluster import KMeans
 from fast_pytorch_kmeans import KMeans
+from kornia.filters import gaussian_blur2d
 import torchvision.transforms.functional as TF
 
 @MODELS.register_module()
@@ -249,7 +250,29 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         cls_logits = cls_emb @ self.query_features.T          # [1, Q]
         return cls_logits
 
-    def forward_feature(self, img, ref_dino, ref_clip, logit_size=None, ex_feats=None, last_feats=None):
+    @torch.no_grad()
+    def _calculate_hf_score(self, patch_tensor: torch.Tensor, sigma1: float = 1.0, sigma2: float = 3.0) -> float:
+        """
+        주어진 이미지 패치(텐서)에 대해 DoG를 사용하여 high-frequency score를 계산합니다.
+        GPU-CPU 병목 현상을 피하기 위해 kornia 라이브러리를 사용합니다.
+        """
+        if patch_tensor.dim() == 3:
+            patch_tensor = patch_tensor.unsqueeze(0)
+        
+        gray_tensor = 0.299 * patch_tensor[:, 0:1, :, :] + 0.587 * patch_tensor[:, 1:2, :, :] + 0.114 * patch_tensor[:, 2:3, :, :]
+        
+        blur1 = gaussian_blur2d(gray_tensor, (int(6*sigma1+1), int(6*sigma1+1)), (sigma1, sigma1))
+        blur2 = gaussian_blur2d(gray_tensor, (int(6*sigma2+1), int(6*sigma2+1)), (sigma2, sigma2))
+        
+        dog = blur1 - blur2
+        
+        e_hf = torch.sum(dog**2)
+        e_tot = torch.sum(gray_tensor**2) + 1e-8
+        hf_score = e_hf / e_tot
+        
+        return hf_score.item()
+
+    def forward_feature(self, img, ref_dino, ref_clip, logit_size=None, ex_feats=None, last_feats=None, hf_score=None, num_sampled=None):
         
         if ex_feats is None:
             ex_feats = self.ref_feature_dino(img)
@@ -263,9 +286,17 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         elif self.model_type == 'GEM':
             image_features = self.net.visual(img)
         elif last_feats is not None:
-            image_features = self.net.encode_from_last_layer(last_feats, self.model_type, self.ignore_residual, output_cls_token=False, ex_feats=ex_feats, ref_dino=ref_dino, ref_clip=ref_clip)
+            image_features = self.net.encode_from_last_layer(
+                last_feats, self.model_type, self.ignore_residual, output_cls_token=False, 
+                ex_feats=ex_feats, ref_dino=ref_dino, ref_clip=ref_clip,
+                hf_score=hf_score, num_sampled=num_sampled
+            )
         else:
-            image_features = self.net.encode_image(img, self.model_type, self.ignore_residual, output_cls_token=False, ex_feats=ex_feats, ref_dino=ref_dino, ref_clip=ref_clip)#self.output_cls_token)  
+            image_features = self.net.encode_image(
+                img, self.model_type, self.ignore_residual, output_cls_token=False, 
+                ex_feats=ex_feats, ref_dino=ref_dino, ref_clip=ref_clip, 
+                hf_score=hf_score, num_sampled=num_sampled
+            ) 
         
         if self.output_cls_token:
             # image_cls_token, image_features = image_features
@@ -531,6 +562,13 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
 
         for h_idx in range(h_grids):
             for w_idx in range(w_grids):
+                # --- 현재 패치 crop 및 hf_score 계산 ---
+                y1, x1 = h_idx * h_stride, w_idx * w_stride
+                y2, x2 = min(y1 + h_crop, h_img), min(x1 + w_crop, w_img)
+                y1, x1 = max(y2 - h_crop, 0), max(x2 - w_crop, 0)
+                crop_img = img[:, :, y1:y2, x1:x2]
+                hf_score = self._calculate_hf_score(crop_img)
+
                 # --- 1. 현재 패치에 대한 '외부 정보 풀' 구성 ---
                 ref_dino, ref_clip = None, None
                 
@@ -569,9 +607,11 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                         dino_samples.append(external_dino_feats[rand_indices])
                         clip_samples.append(external_clip_feats[rand_indices])
                     
+                num_sampled = 0
                 if dino_samples:
                     sampled_dino = torch.cat(dino_samples, dim=0)
                     sampled_clip = torch.cat(clip_samples, dim=0)
+                    num_sampled = sampled_dino.shape[0] # 샘플링된 피처 개수 기록   
                     
                     if _global:
                         final_ref_dino = torch.cat([sampled_dino, global_dino_feats_flat], dim=0)
@@ -602,7 +642,11 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                 else:
                     padded_crop_img = crop_img
 
-                crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=None, last_feats=all_last_feats[patch_counter]) #internal_dino_feats
+                crop_seg_logit = self.forward_feature(
+                    padded_crop_img, ref_dino, ref_clip, 
+                    ex_feats=None, last_feats=all_last_feats[patch_counter], #internal_dino_feats
+                    hf_score=hf_score, num_sampled=num_sampled    
+                ) 
 
                 # --- 예측 결과에서 패딩 제거 ---
                 if any(pad):

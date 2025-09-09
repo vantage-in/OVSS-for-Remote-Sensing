@@ -270,8 +270,10 @@ class CLIP(nn.Module):
                      ex_feats: torch.tensor = None,
                      ref_dino: torch.tensor = None,
                      ref_clip: torch.tensor = None,
+                     hf_score=None, 
+                     num_sampled=None,
                      normalize: bool = False):
-        features = self.visual(image, model_type, ex_feats, ignore_residual, output_cls_token, ref_dino=ref_dino, ref_clip=ref_clip)
+        features = self.visual(image, model_type, ex_feats, ignore_residual, output_cls_token, ref_dino=ref_dino, ref_clip=ref_clip, hf_score=hf_score, num_sampled=num_sampled)
         if output_cls_token:
             cls_token, features = features
             return F.normalize(cls_token, dim=-1) if normalize else cls_token, \
@@ -296,8 +298,10 @@ class CLIP(nn.Module):
                      output_cls_token: bool = False,
                      ex_feats: torch.tensor = None,
                      ref_dino: torch.tensor = None,
-                     ref_clip: torch.tensor = None):
-        return self.visual.forward_from_last_layer(image, model_type, ex_feats, ignore_residual, output_cls_token, ref_dino=ref_dino, ref_clip=ref_clip)
+                     ref_clip: torch.tensor = None,
+                     hf_score=None, 
+                     num_sampled=None):
+        return self.visual.forward_from_last_layer(image, model_type, ex_feats, ignore_residual, output_cls_token, ref_dino=ref_dino, ref_clip=ref_clip, hf_score=hf_score, num_sampled=num_sampled)
 
     def encode_text(self, text, normalize: bool = False):
         cast_dtype = self.transformer.get_cast_dtype()

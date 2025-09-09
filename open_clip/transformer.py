@@ -499,7 +499,7 @@ class VisionTransformer(nn.Module):
 
         return pooled, tokens
 
-    def forward(self, x: torch.Tensor, model_type: str = 'ClearCLIP', ex_feats : torch.tensor = None, ignore_residual=True, output_cls_token=False, last_n_layers=1, ref_dino = None, ref_clip = None):
+    def forward(self, x: torch.Tensor, model_type: str = 'ClearCLIP', ex_feats : torch.tensor = None, ignore_residual=True, output_cls_token=False, last_n_layers=1, ref_dino = None, ref_clip = None, hf_score=None, num_sampled=None):
         B, nc, w, h = x.shape
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
@@ -546,11 +546,11 @@ class VisionTransformer(nn.Module):
 
             for blk in self.transformer.resblocks[-last_n_layers:]:
                 if ignore_residual:
-                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip) # ex_feats added
+                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip, hf_score=None, num_sampled=None) # ex_feats added
 
                     x = blk(x)
                 else:
-                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type, ref_v=ref_clip)
+                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type, ref_v=ref_clip, hf_score=None, num_sampled=None)
                     x_out = x_out + blk.mlp(blk.ln_2(x_out))
                     output += x_out
             output = output[:784, :, :]
@@ -637,7 +637,7 @@ class VisionTransformer(nn.Module):
             out = torch.hstack([torch.zeros((dim1 * dim2 + 1, 1)), v_adjusted])
         return out
     
-    def custom_attn(self, attn_layer, x, ex_feats=None, model_type='ClearCLIP', ref_v=None):
+    def custom_attn(self, attn_layer, x, ex_feats=None, model_type='ClearCLIP', ref_v=None, hf_score=None, num_sampled=None):
         num_heads = attn_layer.num_heads
         num_tokens, bsz, embed_dim = x.size()
         # if ref_v is not None:
@@ -679,6 +679,32 @@ class VisionTransformer(nn.Module):
             q_k = F.normalize(ex_feats, dim=1) # [1, 768, 784]
             similarity = torch.einsum("b c m, b c n -> b m n", q_k, q_k) # [1, 784, 784]
             
+            # 💡 [핵심 수정] 새로운 조건부 Attention Score Gating 로직
+            if hf_score is not None and num_sampled is not None and num_sampled < similarity.shape[1]:
+                global_weight = 1.0 - hf_score
+                
+                sampled_bias = 0.0
+                global_bias = 0.0
+                
+                if global_weight > 0.5:
+                    # [조건 1] Global 특징이 더 중요할 때 (hf_score < 0.5)
+                    # Global 특징의 bias는 0 (영향력 100%)
+                    # Sampled 특징의 영향력을 global_weight에 맞춰 낮춤
+                    # ex: global_weight=0.8 -> sampled_weight = (1-0.8)/0.5 = 0.4
+                    sampled_weight = (1.0 - global_weight) / 0.5
+                    sampled_bias = torch.log(torch.tensor(sampled_weight + 1e-6, device=similarity.device))
+                else:
+                    # [조건 2] Sampled 특징이 더 중요할 때 (hf_score >= 0.5)
+                    # Sampled 특징의 bias는 0 (영향력 100%)
+                    # Global 특징의 영향력을 global_weight 값 그대로 사용하여 낮춤
+                    global_bias = torch.log(torch.tensor(global_weight + 1e-6, device=similarity.device))
+                
+                # 계산된 bias를 각 특징 그룹에 해당하는 어텐션 스코어(row)에 더해줌
+                if num_sampled > 0:
+                    similarity[:, :num_sampled, :] += sampled_bias
+                similarity[:, num_sampled:, :] += global_bias
+
+
             similarity = (similarity - torch.mean(similarity) * beta) * gamma
             if ref_v is not None:
                 similarity[similarity < 0.0] = float('-inf')
@@ -842,7 +868,7 @@ class VisionTransformer(nn.Module):
 
         return v
 
-    def forward_from_last_layer(self, x: torch.Tensor, model_type: str = 'ClearCLIP', ex_feats : torch.tensor = None, ignore_residual=True, output_cls_token=False, last_n_layers=1, ref_dino = None, ref_clip = None):
+    def forward_from_last_layer(self, x: torch.Tensor, model_type: str = 'ClearCLIP', ex_feats : torch.tensor = None, ignore_residual=True, output_cls_token=False, last_n_layers=1, ref_dino = None, ref_clip = None, hf_score=None, num_sampled=None):
 
         if ex_feats is not None:
             ex_feats = ex_feats.flatten(2, 3)
@@ -867,11 +893,11 @@ class VisionTransformer(nn.Module):
 
             for blk in self.transformer.resblocks[-last_n_layers:]:
                 if ignore_residual:
-                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip) # ex_feats added
+                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip, hf_score=None, num_sampled=None) # ex_feats added
 
                     x = blk(x)
                 else:
-                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type, ref_v=ref_clip)
+                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type, ref_v=ref_clip, hf_score=None, num_sampled=None)
                     x_out = x_out + blk.mlp(blk.ln_2(x_out))
                     output += x_out
             output = output[:784, :, :]
