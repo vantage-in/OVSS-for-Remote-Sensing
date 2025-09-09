@@ -8,9 +8,9 @@ from pathlib import Path # 파일 경로 처리를 위해 추가
 
 # --- 1. 설정 변수 ---
 # 사용자가 변경할 수 있는 파라미터들
-IMAGE_PATH = 'demo/image/kyoto_33.tif' # ★ 1. 로컬 이미지 파일 경로로 변경
-CROP_LOCATION = 'bottom_left'  # 'top_left', 'top_right', 'bottom_left', 'bottom_right', 'center' 중 선택
-K_PATCH_INDEX = 320      # 448x488 이미지에서 크롭한 영역의 k번째 패치 (0 ~ 783 사이의 정수)
+IMAGE_PATH = 'demo/whu_aerial/image/val_175.png' # ★ 1. 로컬 이미지 파일 경로로 변경
+CROP_LOCATION = 'top_right'  # 'top_left', 'top_right', 'bottom_left', 'bottom_right', 'center' 중 선택
+K_PATCH_INDEX = 237      # 448x488 이미지에서 크롭한 영역의 k번째 패치 (0 ~ 783 사이의 정수)
 
 # --- 2. 모델 및 전처리기 준비 ---
 def setup_model_and_transforms():

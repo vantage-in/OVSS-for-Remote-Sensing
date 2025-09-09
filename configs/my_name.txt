@@ -1,7 +1,2 @@
 background
-building,roof,house
-road
-water
-barren
-forest
-agricultural
+building

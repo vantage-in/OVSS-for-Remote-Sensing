@@ -4,7 +4,7 @@ _base_ = './base_config.py'
 model = dict(
     name_path='./configs/cls_xBD.txt',
     prob_thd=0.0,
-    cls_token_lambda=0,
+    cls_token_lambda=-0.3, # 0 is original
 )
 
 # dataset settings
