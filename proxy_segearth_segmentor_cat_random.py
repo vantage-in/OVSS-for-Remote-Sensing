@@ -30,6 +30,8 @@ from fast_pytorch_kmeans import KMeans
 from kornia.filters import gaussian_blur2d
 import torchvision.transforms.functional as TF
 
+import cv2
+
 @MODELS.register_module()
 class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
     def __init__(self,
@@ -253,24 +255,63 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
     @torch.no_grad()
     def _calculate_hf_score(self, patch_tensor: torch.Tensor, sigma1: float = 1.0, sigma2: float = 3.0) -> float:
         """
-        주어진 이미지 패치(텐서)에 대해 DoG를 사용하여 high-frequency score를 계산합니다.
-        GPU-CPU 병목 현상을 피하기 위해 kornia 라이브러리를 사용합니다.
+        [수정됨] PyTorch 텐서를 NumPy 배열로 변환하여 OpenCV의 GaussianBlur를 직접 사용하는 함수.
+        참고: 이 함수는 GPU->CPU 데이터 전송으로 인해 성능 저하가 발생할 수 있습니다.
         """
-        if patch_tensor.dim() == 3:
-            patch_tensor = patch_tensor.unsqueeze(0)
-        
-        gray_tensor = 0.299 * patch_tensor[:, 0:1, :, :] + 0.587 * patch_tensor[:, 1:2, :, :] + 0.114 * patch_tensor[:, 2:3, :, :]
-        
-        blur1 = gaussian_blur2d(gray_tensor, (int(6*sigma1+1), int(6*sigma1+1)), (sigma1, sigma1))
-        blur2 = gaussian_blur2d(gray_tensor, (int(6*sigma2+1), int(6*sigma2+1)), (sigma2, sigma2))
-        
+
+        # 1. 텐서 형태 확인 및 GPU 텐서를 CPU NumPy 배열로 변환
+        if patch_tensor.dim() == 4 and patch_tensor.shape[0] == 1:
+            patch_tensor = patch_tensor.squeeze(0) # [C, H, W]
+        patch_tensor = self.unnorm(patch_tensor)
+
+        # [C, H, W] -> [H, W, C] 형태로 변환하고 0-255 범위의 uint8 타입으로 변경
+        img_np = patch_tensor.permute(1, 2, 0).cpu().numpy()
+        img_np = (img_np * 255).astype(np.uint8)
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        # 2. OpenCV를 사용하여 흑백 변환
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+        # 3. OpenCV의 GaussianBlur 두 번 적용
+        blur1 = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma1)
+        blur2 = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma2)
+
+        # 4. DoG 계산 (float으로 변환하여 오버플로우 방지)
         dog = blur1 - blur2
         
-        e_hf = torch.sum(dog**2)
-        e_tot = torch.sum(gray_tensor**2) + 1e-8
-        hf_score = e_hf / e_tot
+        # 5. NumPy를 사용하여 에너지 비율 계산
+        e_hf = np.sum(dog**2)
+        e_tot = np.sum(gray**2) + 1e-8
+        hf_score = float(e_hf / e_tot)
+
+        return hf_score
+
+    # @torch.no_grad()
+    # def _calculate_hf_score(self, patch_tensor: torch.Tensor, sigma1: float = 1.0, sigma2: float = 3.0) -> float:
+    #     """
+    #     주어진 이미지 패치(텐서)에 대해 DoG를 사용하여 high-frequency score를 계산합니다.
+    #     GPU-CPU 병목 현상을 피하기 위해 kornia 라이브러리를 사용합니다.
+    #     """
+    #     if patch_tensor.dim() == 3:
+    #         patch_tensor = patch_tensor.unsqueeze(0)
         
-        return hf_score.item()
+    #     patch_tensor = patch_tensor.float()
+    #     patch_tensor = patch_tensor * 255.0
+
+    #     gray_tensor = 0.299 * patch_tensor[:, 0:1, :, :] + 0.587 * patch_tensor[:, 1:2, :, :] + 0.114 * patch_tensor[:, 2:3, :, :]
+        
+    #     blur1 = gaussian_blur2d(gray_tensor, (int(6*sigma1+1), int(6*sigma1+1)), (sigma1, sigma1))
+    #     blur2 = gaussian_blur2d(gray_tensor, (int(6*sigma2+1), int(6*sigma2+1)), (sigma2, sigma2))
+
+    #     dog = blur1 - blur2
+        
+    #     e_hf = torch.sum(dog**2)
+    #     e_tot = torch.sum(gray_tensor**2) + 1e-8
+    #     hf_score = e_hf / e_tot
+    #     print(e_hf)
+    #     print(e_tot)
+
+    #     return hf_score.item()
 
     def forward_feature(self, img, ref_dino, ref_clip, logit_size=None, ex_feats=None, last_feats=None, hf_score=None, num_sampled=None):
         
@@ -444,7 +485,7 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         [수정됨] 각 슬라이딩 패치에 대해 '자신을 제외한' 외부 정보로 클러스터링 및 샘플링 수행
         """
         printing = False
-        _global = False
+        _global = True
 
         if type(img) == list:
             img = img[0].unsqueeze(0)

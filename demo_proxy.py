@@ -11,7 +11,7 @@ from pathlib import Path
 import matplotlib.patches as mpatches
 import torch
 
-img_path = 'demo/image/zanzibar_125.tif'
+img_path = 'demo/image/aachen_11.tif'
 img = Image.open(img_path)
 base_name = Path(img_path).stem  # 'kyoto_33'
 
@@ -200,7 +200,7 @@ def save_overlay_with_legend(img, seg_mask, filename, name_list):
     
 # === 8. Save the outputs ===
 if model.feature_up:
-    pred_path = Path("visualize/cat") / f"inte_{base_name}_pred.png"
+    pred_path = Path("visualize/cat") / f"gate_{base_name}_pred.png"
     overlay_path = Path("visualize/cat") / f"0822_{base_name}_pred_overlay.png"
 else:
     pred_path = Path("visualize/prediction") / f"08132_{base_name}_no_pred.png"
