@@ -662,7 +662,8 @@ class VisionTransformer(nn.Module):
         if ex_feats is not None:
             if ref_v is not None:
                 beta = 1.5 # Openearthmap / Random Sample
-                # beta = 1.6
+                beta = 1.6
+                # beat = 1.4
             else:
                 beta = 1.2
             gamma = 3.0

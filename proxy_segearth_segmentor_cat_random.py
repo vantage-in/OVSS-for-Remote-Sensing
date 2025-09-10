@@ -408,12 +408,17 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         return seg_pred.squeeze(0) # [28, 28]
 
     # Best
-    def forward_slide(self, img, img_metas, stride=112, crop_size=224):
+    def forward_slide(self, img, img_metas, stride=112, crop_size=224, context_mode='sampling_and_global'):
         """
-        [수정됨] 각 슬라이딩 패치에 대해 '자신을 제외한' 외부 정보로 클러스터링 및 샘플링 수행
+        [MODIFIED] Adds a `context_mode` option to control the context embeddings.
+        Options for context_mode:
+        - 'sampling_and_global': Uses both sampled and global embeddings.
+        - 'global_only': Uses only global embeddings.
+        - 'sampling_only': Uses only sampled embeddings.
         """
         printing = False
-        _global = False
+        use_global = 'global' in context_mode
+        use_sampling = 'sampling' in context_mode
 
         if type(img) == list:
             img = img[0].unsqueeze(0)
@@ -430,9 +435,10 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         device = img.device
         
         # ========================================================================
-        # Phase 0: 이미지 전체의 '글로벌 뷰' 피처 추출
+        # Phase 0: Extract global features if needed
         # ========================================================================
-        if _global:
+        global_dino_feats_flat, global_clip_feats_flat = None, None
+        if use_global:
             if printing: print("Phase 0: Extracting global context features...")
             with torch.no_grad():
                 global_view_img = F.interpolate(img, size=(224, 224), mode='bilinear', align_corners=False)
@@ -448,81 +454,67 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                 global_clip_feats_flat = global_clip_feats_flat.to(dtype=torch.float32)
                 if printing: print(f"  - Extracted {global_dino_feats_flat.shape[0]} global feature pairs.")
 
-
         # ========================================================================
-        # Phase 1: 강건한(Robust) 개별 피처 임베딩 및 '패치 ID' 수집
+        # Phase 1: Collect and sample patch features if needed
         # ========================================================================
-        if printing: print("Phase 1: Collecting robust feature embeddings and their patch IDs...") 
         
-        all_robust_dino = []
-        all_robust_clip = []
-        all_robust_patch_ids = [] # [추가] 각 임베딩의 소속 패치 ID를 저장할 리스트
-        total_feature_patches = 0
-        patch_counter = 0
 
         all_last_feats = []
 
-        for h_idx in range(h_grids):
-            for w_idx in range(w_grids):
-                # ... (crop_img 생성 및 강건성 마스크 계산 로직은 동일) ...
-                y1, x1 = h_idx * h_stride, w_idx * w_stride
-                y2, x2 = min(y1 + h_crop, h_img), min(x1 + w_crop, w_img)
-                y1, x1 = max(y2 - h_crop, 0), max(x2 - w_crop, 0)
-                crop_img = img[:, :, y1:y2, x1:x2]
+        all_robust_dino_feats, all_robust_clip_feats, all_robust_patch_ids = None, None, None
 
-                H_orig, W_orig = crop_img.shape[-2:]
-                pad = self.compute_padsize(H_orig, W_orig, self.patch_size[0])
+        if use_sampling:
+            if printing: print("Phase 1: Collecting robust feature embeddings and their patch IDs...") 
 
-                if any(pad):
-                    padded_img = F.pad(crop_img, pad, mode='constant', value=0)
-                else:
-                    padded_img = crop_img
+            patch_counter = 0
+            all_robust_dino, all_robust_clip, all_robust_patch_ids = [], [], []
 
-                x = self.net.encode_before_last_layer(padded_img)
-                all_last_feats.append(x)
+            for h_idx in range(h_grids):
+                for w_idx in range(w_grids):
+                    # ... (crop_img 생성 및 강건성 마스크 계산 로직은 동일) ...
+                    y1, x1 = h_idx * h_stride, w_idx * w_stride
+                    y2, x2 = min(y1 + h_crop, h_img), min(x1 + w_crop, w_img)
+                    y1, x1 = max(y2 - h_crop, 0), max(x2 - w_crop, 0)
+                    crop_img = img[:, :, y1:y2, x1:x2]
 
-                dino_feat = self.ref_feature_dino(padded_img) # 원래는 여기 pad 안한 걸 썼음 (전달용)
-                clip_feat = self.net.encode_value_projection(x)
+                    H_orig, W_orig = crop_img.shape[-2:]
+                    pad = self.compute_padsize(H_orig, W_orig, self.patch_size[0])
 
-                # seg_pred = self._predict_feature_map(padded_img, x, dino_feat)
+                    if any(pad):
+                        padded_img = F.pad(crop_img, pad, mode='constant', value=0)
+                    else:
+                        padded_img = crop_img
 
-                # if any(pad):
-                #     H_feat_orig = H_orig // self.dino_patch_size
-                #     W_feat_orig = W_orig // self.dino_patch_size
-                #     l_feat, _, t_feat, _ = [p // self.dino_patch_size for p in pad]
-            
-                #     seg_pred = seg_pred[t_feat:t_feat + H_feat_orig, l_feat:l_feat + W_feat_orig]
+                    x = self.net.encode_before_last_layer(padded_img)
+                    all_last_feats.append(x)
 
-                # H_feat, W_feat = seg_pred.shape
-                # total_feature_patches += H_feat * W_feat
+                    dino_feat = self.ref_feature_dino(padded_img) # 원래는 여기 pad 안한 걸 썼음 (전달용)
+                    clip_feat = self.net.encode_value_projection(x)
 
-                dino_feat_flat = dino_feat.flatten(2, 3).permute(0, 2, 1).reshape(-1, dino_feat.shape[1])
-                clip_feat_flat = clip_feat.flatten(2, 3).permute(2, 0, 1).reshape(-1, clip_feat.shape[0] * clip_feat.shape[1])
+                    dino_feat_flat = dino_feat.flatten(2, 3).permute(0, 2, 1).reshape(-1, dino_feat.shape[1])
+                    clip_feat_flat = clip_feat.flatten(2, 3).permute(2, 0, 1).reshape(-1, clip_feat.shape[0] * clip_feat.shape[1])
 
-                all_robust_dino.append(dino_feat_flat)
-                all_robust_clip.append(clip_feat_flat)
+                    all_robust_dino.append(dino_feat_flat)
+                    all_robust_clip.append(clip_feat_flat)
 
-                # [추가] 이 강건한 피처들이 현재 패치(patch_counter) 소속임을 기록
-                num_robust_in_patch = dino_feat_flat.shape[0]
-                all_robust_patch_ids.append(torch.full((num_robust_in_patch,), patch_counter, device=device))
+                    # [추가] 이 강건한 피처들이 현재 패치(patch_counter) 소속임을 기록
+                    num_robust_in_patch = dino_feat_flat.shape[0]
+                    all_robust_patch_ids.append(torch.full((num_robust_in_patch,), patch_counter, device=device))
 
-                patch_counter += 1
+                    patch_counter += 1
         
-        # 수집된 모든 강건한 임베딩과 ID를 하나의 텐서로 통합
-        if not all_robust_dino:
-             all_robust_dino_feats = torch.empty(0, 768, device=device)
-             all_robust_clip_feats = torch.empty(0, 768, device=device)
-             all_robust_patch_ids = torch.empty(0, dtype=torch.long, device=device)
-        else:
-            all_robust_dino_feats = torch.cat(all_robust_dino, dim=0).to(dtype=torch.float32)
-            all_robust_clip_feats = torch.cat(all_robust_clip, dim=0).to(dtype=torch.float32)
-            all_robust_patch_ids = torch.cat(all_robust_patch_ids, dim=0)
+            # 수집된 모든 강건한 임베딩과 ID를 하나의 텐서로 통합
+            if all_robust_dino:
+                all_robust_dino_feats = torch.cat(all_robust_dino, dim=0).to(dtype=torch.float32)
+                all_robust_clip_feats = torch.cat(all_robust_clip, dim=0).to(dtype=torch.float32)
+                all_robust_patch_ids = torch.cat(all_robust_patch_ids, dim=0)
 
-        num_total_robust = all_robust_dino_feats.shape[0]
-        if printing: print(f"  - Collected {num_total_robust} robust feature embeddings in total.")
+            if printing: 
+                num_total_robust = all_robust_dino_feats.shape[0]
+                print(f"  - Collected {num_total_robust} robust feature embeddings in total.")
 
         # ========================================================================
-        # Phase 2 & 3: 동적 외부 정보 샘플링 및 최종 예측
+        # Phase 2 & 3: Final prediction with selected context
         # ========================================================================
         if printing: print("Phase 2 & 3: Performing dynamic sampling and final prediction...")
         preds = img.new_zeros((batch_size, self.num_queries, h_img, w_img))
@@ -531,65 +523,71 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
 
         for h_idx in range(h_grids):
             for w_idx in range(w_grids):
-                # --- 1. 현재 패치에 대한 '외부 정보 풀' 구성 ---
+                sampled_dino, sampled_clip = None, None
+                num_sampled = 0
+
+                # --- Perform K-means sampling if needed ---
+                if use_sampling and all_robust_dino_feats is not None:
+                    external_mask = (all_robust_patch_ids != patch_counter)
+                    external_dino_feats = all_robust_dino_feats[external_mask]
+                    external_clip_feats = all_robust_clip_feats[external_mask]
+                    num_external_robust = external_dino_feats.shape[0]
+
+                    # internal_mask = (all_robust_patch_ids == patch_counter)
+                    # internal_dino_feats = all_robust_dino_feats[internal_mask]
+                    # #internal_dino_feats = internal_dino_feats.permute(1, 0).reshape(-1, 28, 28).unsqueeze(0) # <- 위험
+
+                    if printing: 
+                        print(f"  - Performing K-Means on {num_external_robust} feature embeddings.")
+
+                    if num_external_robust > 0:
+                        K = 25
+                        K = min(K, num_external_robust)
+                        kmeans = KMeans(n_clusters=K, init_method="kmeans++", mode="cosine", max_iter=25)
+                        labels = kmeans.fit_predict(external_dino_feats)
+
+                        M = 80
+                        dino_samples, clip_samples = [], []
+                        for cid in range(K):
+                            member_indices = (labels == cid).nonzero(as_tuple=True)[0]
+                            if len(member_indices) == 0: continue
+                            
+                            torch.manual_seed = 42
+                            if len(member_indices) > M:
+                                rand_indices = member_indices[torch.randperm(len(member_indices), device=device)[:M]]
+                            else:
+                                rand_indices = member_indices[torch.randint(0, len(member_indices), (M,), device=device)]
+                            
+                            dino_samples.append(external_dino_feats[rand_indices])
+                            clip_samples.append(external_clip_feats[rand_indices])
+                        
+                    # 여기서부터
+                    if dino_samples:
+                        sampled_dino = torch.cat(dino_samples, dim=0)
+                        sampled_clip = torch.cat(clip_samples, dim=0)
+                        num_sampled = sampled_dino.shape[0]
+                    
+                # --- Construct final reference features based on context_mode ---
+                dino_frags, clip_frags = [], []
+                if use_sampling and sampled_dino is not None:
+                    dino_frags.append(sampled_dino)
+                    clip_frags.append(sampled_clip)
+                if use_global and global_dino_feats_flat is not None:
+                    dino_frags.append(global_dino_feats_flat)
+                    clip_frags.append(global_clip_feats_flat)
+
+                final_ref_dino = torch.cat(dino_frags, dim=0) if dino_frags else torch.empty(0, 768, device=device)
+                final_ref_clip = torch.cat(clip_frags, dim=0) if clip_frags else torch.empty(0, 768, device=device)
+
+                if printing: 
+                    print(f"  - {final_ref_dino.shape[0]} feature embeddings in total.")
+
                 ref_dino, ref_clip = None, None
-                
-                # 현재 패치 ID를 제외한 외부 임베딩만 선택
-                external_mask = (all_robust_patch_ids != patch_counter)
-                external_dino_feats = all_robust_dino_feats[external_mask]
-                external_clip_feats = all_robust_clip_feats[external_mask]
-
-                internal_mask = (all_robust_patch_ids == patch_counter)
-                internal_dino_feats = all_robust_dino_feats[internal_mask]
-                #internal_dino_feats = internal_dino_feats.permute(1, 0).reshape(-1, 28, 28).unsqueeze(0) # <- 위험
-
-                num_external_robust = external_dino_feats.shape[0]
-                
-                if num_external_robust > 0:
-                    # --- 2. 외부 정보 풀에 대해 K-means 및 샘플링 수행 ---
-                    K = 25
-                    K = min(K, num_external_robust)
-                    # kmeans = KMeans(n_clusters=K, init="k-means++", n_init=1, max_iter=25, random_state=42)
-                    # labels = torch.tensor(kmeans.fit_predict(external_dino_feats.cpu().numpy()), device=device, dtype=torch.long)
-                    kmeans = KMeans(n_clusters=K, init_method="kmeans++", mode="cosine", max_iter=25)
-                    labels = kmeans.fit_predict(external_dino_feats)
-
-                    M = 80
-                    dino_samples, clip_samples = [], []
-                    for cid in range(K):
-                        member_indices = (labels == cid).nonzero(as_tuple=True)[0]
-                        if len(member_indices) == 0: continue
-                        
-                        torch.manual_seed = 42
-                        if len(member_indices) > M:
-                            rand_indices = member_indices[torch.randperm(len(member_indices), device=device)[:M]]
-                        else:
-                            rand_indices = member_indices[torch.randint(0, len(member_indices), (M,), device=device)]
-                        
-                        dino_samples.append(external_dino_feats[rand_indices])
-                        clip_samples.append(external_clip_feats[rand_indices])
-                    
-                if dino_samples:
-                    sampled_dino = torch.cat(dino_samples, dim=0)
-                    sampled_clip = torch.cat(clip_samples, dim=0)
-                    
-                    if _global:
-                        final_ref_dino = torch.cat([sampled_dino, global_dino_feats_flat], dim=0)
-                        final_ref_clip = torch.cat([sampled_clip, global_clip_feats_flat], dim=0)
-                    else:
-                        final_ref_dino = sampled_dino
-                        final_ref_clip = sampled_clip
-                else:
-                    # 샘플링할 패치가 없는 경우, 글로벌 정보만 사용
-                    final_ref_dino = global_dino_feats_flat
-                    final_ref_clip = global_clip_feats_flat
-
                 if final_ref_dino.shape[0] > 0:
                     ref_dino = final_ref_dino.t().unsqueeze(0).contiguous()
                     ref_clip = final_ref_clip.view(-1, 12, 64).permute(1, 2, 0).contiguous()
 
-
-                # --- 3. 최종 예측 수행 ---
+                # --- Final Prediction ---
                 y1, x1 = h_idx * h_stride, w_idx * w_stride
                 y2, x2 = min(y1 + h_crop, h_img), min(x1 + w_crop, w_img)
                 y1, x1 = max(y2 - h_crop, 0), max(x2 - w_crop, 0)
@@ -602,7 +600,10 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                 else:
                     padded_crop_img = crop_img
 
-                crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=None, last_feats=all_last_feats[patch_counter]) #internal_dino_feats
+                if not use_sampling:
+                    crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=None, last_feats=None) #internal_dino_feats
+                else:
+                    crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=None, last_feats=all_last_feats[patch_counter]) #internal_dino_feats
 
                 # --- 예측 결과에서 패딩 제거 ---
                 if any(pad):
