@@ -680,85 +680,6 @@ class VisionTransformer(nn.Module):
             similarity = torch.einsum("b c m, b c n -> b m n", q_k, q_k) # [1, 784, 784]
 
             similarity = (similarity - torch.mean(similarity) * beta) * gamma
-
-            # 💡 [핵심 수정] 새로운 조건부 Attention Score Gating 로직
-            # if hf_score is not None and num_sampled is not None and num_sampled < similarity.shape[1]:
-            #     num_local_tokens = 784
-            #     global_start_index = ex_feats.shape[2] - 784 # global
-
-            #     # Global 임베딩이 존재하는 경우에만 Gating 수행
-            #     if global_start_index < similarity.shape[1]:
-            #         # 2-2. 곱셈 가중치 계산 (0~2 범위)
-            #         global_weight = 1.0 - hf_score
-
-            #         # ------------(3) 덧셈 기반------------
-            #         final_sampling_weight = 1.0
-            #         final_global_weight = 1.0
-
-            #         if global_weight > 0.5:
-            #             final_sampling_weight = (1.0 - global_weight) / global_weight
-            #         else:
-            #             final_global_weight = global_weight / (1.0 - global_weight)
-
-            #         # 가중치를 log-space의 bias로 변환
-            #         sampling_bias = torch.log(torch.tensor(final_sampling_weight + 1e-6, device=similarity.device))
-            #         global_bias = torch.log(torch.tensor(final_global_weight + 1e-6, device=similarity.device))
-                    
-            #         bias_weights = torch.zeros(similarity.shape[1], device=similarity.device)
-            #         if num_sampled > 0:
-            #             bias_weights[num_local_tokens:global_start_index] = sampling_bias
-            #         bias_weights[global_start_index:] = global_bias
-                    
-            #         # 외적을 이용해 bias 행렬 생성
-            #         gating_bias_matrix = bias_weights.unsqueeze(1) + bias_weights.unsqueeze(0)
-                    
-            #         similarity = similarity + gating_bias_matrix.unsqueeze(0)
-            #         # ------------(3) 덧셈 기반------------
-
-            #         # ----------------(2) 곱셈 기반 w/ max 그대로-------------------
-            #         # final_sampling_weight = 1.0
-            #         # final_global_weight = 1.0
-
-            #         # # 2-2. 조건에 따라 가중치 비대칭적으로 계산
-            #         # if global_weight > 0.5:
-            #         #     final_sampling_weight = (1.0 - global_weight) / global_weight
-            #         # else:
-            #         #     final_global_weight = global_weight / (1.0 - global_weight)
-
-            #         # # 2-3. 가중치를 적용할 위치에 대한 마스크 생성
-            #         # num_total_tokens = similarity.shape[1]
-            #         # weights = torch.ones(num_total_tokens, device=similarity.device)
-
-            #         # if num_sampled > 0:
-            #         #     weights[num_local_tokens:global_start_index] = final_sampling_weight
-            #         # weights[global_start_index:] = final_global_weight
-
-            #         # gating_multiplier = weights.unsqueeze(1) @ weights.unsqueeze(0)
-
-            #         # similarity = similarity * gating_multiplier.unsqueeze(0)
-            #         # ----------------(2)-------------------
-
-            #         # -------------(1) 곱셈 기반 global만 조절--------------
-            #         # gating_weight = global_weight * 2.0
-
-            #         # # 2-3. 가중치를 적용할 위치에 대한 boolean 마스크 생성
-            #         # num_total_tokens = similarity.shape[1]
-            #         # is_global = torch.zeros(num_total_tokens, dtype=torch.bool, device=similarity.device)
-            #         # is_global[global_start_index:] = True
-
-            #         # # row가 global인 경우 OR column이 global인 경우를 모두 선택
-            #         # row_is_global = is_global[None, :, None] # [1, N, 1]
-            #         # col_is_global = is_global[None, None, :] # [1, 1, N]
-            #         # gating_mask = row_is_global | col_is_global
-
-            #         # # 2-4. 마스크를 이용하여 곱셈 가중치 행렬 생성
-            #         # # 기본값은 1, 마스크가 True인 위치는 gating_weight 값으로 설정
-            #         # gating_multiplier = torch.ones_like(similarity)
-            #         # gating_multiplier[gating_mask] = gating_weight
-                    
-            #         # # 2-5. similarity에 가중치를 정확히 한 번 곱해줌
-            #         # similarity = similarity * gating_multiplier
-            #         # -------------(1)---------------
             
             if ref_v is not None:
                 similarity[similarity < 0.0] = float('-inf')
@@ -770,6 +691,8 @@ class VisionTransformer(nn.Module):
             mask_pre = mask_pre.reshape(bsz * num_heads, mask_pre.shape[2], mask_pre.shape[3])
             attn_weights_pre = F.softmax(mask_pre, dim=-1)
             
+            # print(hf_score)
+
             if hf_score is not None and num_sampled is not None:
                 num_local_tokens = 784
                 global_start_index = num_local_tokens + num_sampled
@@ -814,6 +737,70 @@ class VisionTransformer(nn.Module):
             else:
                 attn_weights = attn_weights_pre
             # --------------- (4) -------------
+
+            # --------------- (NEW) -----------
+            # # 💡 [핵심 수정] 독립적인 Softmax 후 가중합 및 재정규화
+            # num_local_tokens = 784
+            # global_start_index = num_local_tokens + num_sampled
+
+            # # 2. Similarity 행렬을 internal, sampled, global 부분으로 슬라이싱
+            # # (Query는 항상 internal token 기준)
+            # sim_to_internal = similarity[:, :num_local_tokens, :num_local_tokens]
+            
+            # sim_to_sampled = None
+            # if num_sampled > 0:
+            #     sim_to_sampled = similarity[:, :num_local_tokens, num_local_tokens:global_start_index]
+
+            # sim_to_global = None
+            # if global_start_index < similarity.shape[1]:
+            #     sim_to_global = similarity[:, :num_local_tokens, global_start_index:]
+
+            # # 3. 각 부분에 대해 독립적으로 Softmax 적용
+            # attn_weights_internal = F.softmax(sim_to_internal, dim=-1)
+
+            # attn_weights_sampled = None
+            # if sim_to_sampled is not None:
+            #     attn_weights_sampled = F.softmax(sim_to_sampled, dim=-1)
+
+            # attn_weights_global = None
+            # if sim_to_global is not None:
+            #     attn_weights_global = F.softmax(sim_to_global, dim=-1)
+
+            # # 4. hf_score를 이용해 가중치 적용
+            # if hf_score is None: hf_score = 0.5 # hf_score가 없을 경우 기본값
+            
+            # # final_attn_frags = [attn_weights_internal]
+            # # if attn_weights_sampled is not None:
+            # #     final_attn_frags.append(hf_score * attn_weights_sampled)
+            # # if attn_weights_global is not None:
+            # #     final_attn_frags.append((1.0 - hf_score) * attn_weights_global)
+            
+            # global_weight = 1.0 - hf_score
+            # sampling_weight = 1.0
+
+            # if global_weight > 0.5:
+            #     # Global이 중요: Global 가중치는 1, Sampling 가중치는 비율로 계산
+            #     sampling_weight = (1.0 - global_weight) / global_weight
+            # else:
+            #     # Sampling이 중요: Sampling 가중치는 1, Global 가중치는 비율로 계산
+            #     global_weight = global_weight / (1.0 - global_weight)
+            
+            # # 5. 계산된 가중치 적용 및 결합
+            # final_attn_frags = [attn_weights_internal]
+            # if attn_weights_sampled is not None:
+            #     final_attn_frags.append(sampling_weight * attn_weights_sampled)
+            # if attn_weights_global is not None:
+            #     final_attn_frags.append(global_weight * attn_weights_global)
+
+            # final_attn = torch.cat(final_attn_frags, dim=-1)
+
+            # # 5. 가중합된 어텐션 가중치를 다시 정규화
+            # attn_weights_single_head = final_attn / (final_attn.sum(dim=-1, keepdim=True) + 1e-8)
+
+            # # 💡 6. [핵심 수정] 어텐션 가중치를 Multi-head에 맞게 확장
+            # attn_weights = attn_weights_single_head.unsqueeze(1).repeat(1, num_heads, 1, 1)
+            # attn_weights = attn_weights.reshape(bsz * num_heads, num_local_tokens, -1)
+            # --------------- (NEW) -----------
 
             # mask = similarity.to(q.dtype).unsqueeze(1).repeat(1, num_heads, 1, 1)
             # mask = mask.reshape(bsz * num_heads, mask.shape[2], mask.shape[3])

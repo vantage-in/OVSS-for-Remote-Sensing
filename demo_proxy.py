@@ -11,7 +11,7 @@ from pathlib import Path
 import matplotlib.patches as mpatches
 import torch
 
-img_path = 'demo/image/aachen_11.tif'
+img_path = 'demo/image/lubuskie_8.tif'
 img = Image.open(img_path)
 base_name = Path(img_path).stem  # 'kyoto_33'
 

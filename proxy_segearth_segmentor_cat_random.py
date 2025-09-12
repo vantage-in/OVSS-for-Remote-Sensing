@@ -253,6 +253,46 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         return cls_logits
 
     @torch.no_grad()
+    def _calculate_hf_score_multiscale(self, patch_tensor: torch.Tensor, sigmas=[(1,2), (1,6), (4,8), (8,16), (16,32), (32,64)]) -> tuple[float, list[float]]:
+        """
+        [NEW] 여러 스케일의 DoG를 계산하여 가장 큰 hf_score와 각 스케일별 점수 리스트를 반환합니다.
+        사용자의 레퍼런스 코드와 동일하게 uint8 타입으로 DoG를 계산합니다.
+        """
+        # 1. 텐서를 NumPy 배열로 변환 (기존과 동일)
+        if patch_tensor.dim() == 4 and patch_tensor.shape[0] == 1:
+            patch_tensor = patch_tensor.squeeze(0)
+        patch_tensor = self.unnorm(patch_tensor)
+
+        img_np = patch_tensor.permute(1, 2, 0).cpu().numpy()
+        img_np = (img_np * 255).astype(np.uint8)
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        # 2. 흑백 변환 (결과는 uint8)
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        e_tot = np.sum(gray**2) + 1e-8
+        
+        scores = []
+        # 4. 각 시그마 스케일에 대해 반복
+        for s1, s2 in sigmas:
+            # 4-1. uint8 이미지에 GaussianBlur 적용
+            blur1 = cv2.GaussianBlur(gray, (0, 0), sigmaX=s1)
+            blur2 = cv2.GaussianBlur(gray, (0, 0), sigmaX=s2)
+            
+            # 4-2. uint8 상태에서 DoG 계산 (wrap-around 효과 재현)
+            dog = blur1 - blur2
+            
+            # 4-3. e_hf 계산 (float32로 변환 후)
+            e_hf = np.sum(dog**2)
+            
+            # 4-4. 현재 스케일의 hf_score 계산 및 저장
+            scores.append(e_hf / e_tot)
+            
+        # 5. 가장 큰 점수와 점수 리스트 전체를 반환
+        max_score = float(np.max(scores)) if scores else 0.0
+        
+        return max_score, scores
+
+    @torch.no_grad()
     def _calculate_hf_score(self, patch_tensor: torch.Tensor, sigma1: float = 1.0, sigma2: float = 3.0) -> float:
         """
         [수정됨] PyTorch 텐서를 NumPy 배열로 변환하여 OpenCV의 GaussianBlur를 직접 사용하는 함수.
@@ -609,6 +649,7 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                 y1, x1 = max(y2 - h_crop, 0), max(x2 - w_crop, 0)
                 crop_img = img[:, :, y1:y2, x1:x2]
                 hf_score = self._calculate_hf_score(crop_img)
+                # hf_score, _ = self._calculate_hf_score_multiscale(crop_img)
 
                 # --- 1. 현재 패치에 대한 '외부 정보 풀' 구성 ---
                 ref_dino, ref_clip = None, None
@@ -639,7 +680,7 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                         member_indices = (labels == cid).nonzero(as_tuple=True)[0]
                         if len(member_indices) == 0: continue
                         
-                        torch.manual_seed = 42
+                        torch.manual_seed(42)
                         if len(member_indices) > M:
                             rand_indices = member_indices[torch.randperm(len(member_indices), device=device)[:M]]
                         else:

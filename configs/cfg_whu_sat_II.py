@@ -3,7 +3,7 @@ _base_ = './base_config.py'
 # model settings
 model = dict(
     name_path='./configs/cls_whu.txt',
-    prob_thd=0.7,
+    prob_thd=0.75, # 0.7
 )
 
 # dataset settings
