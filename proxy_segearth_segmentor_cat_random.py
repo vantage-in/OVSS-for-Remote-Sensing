@@ -253,6 +253,107 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         return cls_logits
 
     @torch.no_grad()
+    def _calculate_hf_score_multiscale_torch(self, patch_tensor: torch.Tensor, sigmas=[(1,2), (1,6), (4,8), (8,16), (16,32), (32,64)]) -> tuple[float, list[float]]:
+        """
+        [PyTorch Version] NumPy/OpenCV 버전과 100% 동일한 결과를 내면서
+        GPU에서 모든 연산을 수행하여 속도를 향상시킨 버전.
+        """
+        # 1. 텐서 준비 (Un-normalize 및 0-255 uint8 스케일링)
+        if patch_tensor.dim() == 4 and patch_tensor.shape[0] == 1:
+            patch_tensor = patch_tensor.squeeze(0)
+        unnormalized_tensor = self.unnorm(patch_tensor)
+
+        # 2. RGB to Grayscale 변환 (uint8)
+        img_uint8 = (unnormalized_tensor * 255).round().clamp(0, 255).to(torch.uint8)
+        gray_uint8 = (0.299 * img_uint8[0] + 0.587 * img_uint8[1] + 0.114 * img_uint8[2]).to(torch.uint8)
+        
+        # 3. e_tot 계산 (uint8 제곱 오버플로우 재현)
+        # 제곱 연산 시 uint8 오버플로우가 발생하고, 합산 시 오버플로우를 막기 위해 long으로 캐스팅
+        e_tot = torch.sum((gray_uint8**2).long()) + 1e-8
+        
+        scores = []
+        # 4. 각 시그마 스케일에 대해 반복
+        for s1, s2 in sigmas:
+            # 4-1. PyTorch 기반 GaussianBlur 적용 (uint8 입력 -> uint8 출력)
+            blur1 = self._gaussian_blur_opencv_like_torch(gray_uint8, sigma=s1)
+            blur2 = self._gaussian_blur_opencv_like_torch(gray_uint8, sigma=s2)
+            
+            # 4-2. uint8 상태에서 DoG 계산 (wrap-around 뺄셈 재현)
+            dog = blur1 - blur2
+            
+            # 4-3. e_hf 계산 (uint8 제곱 오버플로우 재현)
+            e_hf = torch.sum((dog**2).long())
+            
+            # 4-4. 현재 스케일의 hf_score 계산 및 저장
+            scores.append(e_hf / e_tot)
+            
+        # 5. 가장 큰 점수와 점수 리스트 전체를 반환
+        max_score = torch.max(torch.tensor(scores)).item() if scores else 0.0
+        
+        return max_score, [s.item() for s in scores]
+
+    @torch.no_grad()
+    def _calculate_hf_score_torch(self, patch_tensor: torch.Tensor, sigma1: float = 1.0, sigma2: float = 3.0) -> float:
+        """
+        [PyTorch Version] NumPy/OpenCV 버전과 100% 동일한 결과를 내면서
+        GPU에서 모든 연산을 수행하여 속도를 향상시킨 단일 스케일 버전.
+        """
+        # 1. 텐서 준비 (Un-normalize 및 0-255 uint8 스케일링)
+        if patch_tensor.dim() == 4 and patch_tensor.shape[0] == 1:
+            patch_tensor = patch_tensor.squeeze(0)
+        unnormalized_tensor = self.unnorm(patch_tensor)
+
+        # 2. RGB to Grayscale 변환 (uint8)
+        img_uint8 = (unnormalized_tensor * 255).round().clamp(0, 255).to(torch.uint8)
+        gray_uint8 = (0.299 * img_uint8[0] + 0.587 * img_uint8[1] + 0.114 * img_uint8[2]).to(torch.uint8)
+        
+        # 3. PyTorch 기반 GaussianBlur 적용 (uint8 입력 -> uint8 출력)
+        blur1 = self._gaussian_blur_opencv_like_torch(gray_uint8, sigma=sigma1)
+        blur2 = self._gaussian_blur_opencv_like_torch(gray_uint8, sigma=sigma2)
+        
+        # 4. uint8 상태에서 DoG 계산 (wrap-around 뺄셈 재현)
+        dog = blur1 - blur2
+        
+        # 5. 에너지 비율 계산 (uint8 제곱 오버플로우 재현)
+        e_hf = torch.sum((dog**2).long())
+        e_tot = torch.sum((gray_uint8**2).long()) + 1e-8
+        hf_score = (e_hf / e_tot).item()
+
+        return hf_score
+
+    def _get_gaussian_kernel_torch(self, ksize: int, sigma: float, device: torch.device) -> torch.Tensor:
+        """PyTorch 1D 가우시안 커널을 생성합니다."""
+        center = ksize // 2
+        x = torch.arange(ksize, dtype=torch.float32, device=device) - center
+        kernel1d = torch.exp(-(x ** 2) / (2 * sigma ** 2))
+        return kernel1d / kernel1d.sum()
+
+    def _gaussian_blur_opencv_like_torch(self, x_uint8: torch.Tensor, sigma: float) -> torch.Tensor:
+        """
+        OpenCV와 동일하게 동작하는 PyTorch 기반 가우시안 블러.
+        uint8 텐서를 입력받아 uint8 텐서를 반환합니다.
+        """
+        # 1. OpenCV와 동일한 커널 크기 결정
+        ksize = int(round(sigma * 3)) * 2 + 1
+        
+        # 2. 커널 생성
+        kernel1d = self._get_gaussian_kernel_torch(ksize, sigma, x_uint8.device)
+        kernel2d = torch.outer(kernel1d, kernel1d).unsqueeze(0).unsqueeze(0) # [1, 1, ksize, ksize]
+        
+        # 3. uint8 텐서를 float32로 변환하여 컨볼루션 준비
+        x_float32 = x_uint8.float().unsqueeze(0).unsqueeze(0)
+
+        # 4. BORDER_REFLECT_101 방식의 패딩 적용
+        padding = ksize // 2
+        padded_x = F.pad(x_float32, (padding, padding, padding, padding), mode='reflect')
+        
+        # 5. 2D 컨볼루션으로 블러 적용
+        blurred_float = F.conv2d(padded_x, kernel2d, padding='valid').squeeze(0).squeeze(0)
+        
+        # 6. 다시 uint8 타입으로 변환하여 반환
+        return blurred_float.round().clamp(0, 255).to(torch.uint8)
+
+    @torch.no_grad()
     def _calculate_hf_score_multiscale(self, patch_tensor: torch.Tensor, sigmas=[(1,2), (1,6), (4,8), (8,16), (16,32), (32,64)]) -> tuple[float, list[float]]:
         """
         [NEW] 여러 스케일의 DoG를 계산하여 가장 큰 hf_score와 각 스케일별 점수 리스트를 반환합니다.
@@ -648,8 +749,10 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                 y2, x2 = min(y1 + h_crop, h_img), min(x1 + w_crop, w_img)
                 y1, x1 = max(y2 - h_crop, 0), max(x2 - w_crop, 0)
                 crop_img = img[:, :, y1:y2, x1:x2]
-                hf_score = self._calculate_hf_score(crop_img)
+                # hf_score = self._calculate_hf_score(crop_img)
+                hf_score = self._calculate_hf_score_torch(crop_img)
                 # hf_score, _ = self._calculate_hf_score_multiscale(crop_img)
+                # hf_score, _ = self._calculate_hf_score_multiscale_torch(crop_img)
 
                 # --- 1. 현재 패치에 대한 '외부 정보 풀' 구성 ---
                 ref_dino, ref_clip = None, None
