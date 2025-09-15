@@ -27,7 +27,10 @@ from myutils import UnNormalize
 from segment_anything import sam_model_registry
 # from sklearn.cluster import KMeans
 from fast_pytorch_kmeans import KMeans
+from kornia.filters import gaussian_blur2d
 import torchvision.transforms.functional as TF
+
+import cv2
 
 @MODELS.register_module()
 class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
@@ -249,7 +252,209 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         cls_logits = cls_emb @ self.query_features.T          # [1, Q]
         return cls_logits
 
-    def forward_feature(self, img, ref_dino, ref_clip, logit_size=None, ex_feats=None, last_feats=None):
+    @torch.no_grad()
+    def _calculate_hf_score_multiscale_torch(self, patch_tensor: torch.Tensor, sigmas=[(1,2), (1,6), (4,8), (8,16), (16,32), (32,64)]) -> tuple[float, list[float]]:
+        """
+        [PyTorch Version] NumPy/OpenCV 버전과 100% 동일한 결과를 내면서
+        GPU에서 모든 연산을 수행하여 속도를 향상시킨 버전.
+        """
+        # 1. 텐서 준비 (Un-normalize 및 0-255 uint8 스케일링)
+        if patch_tensor.dim() == 4 and patch_tensor.shape[0] == 1:
+            patch_tensor = patch_tensor.squeeze(0)
+        unnormalized_tensor = self.unnorm(patch_tensor)
+
+        # 2. RGB to Grayscale 변환 (uint8)
+        img_uint8 = (unnormalized_tensor * 255).round().clamp(0, 255).to(torch.uint8)
+        gray_uint8 = (0.299 * img_uint8[0] + 0.587 * img_uint8[1] + 0.114 * img_uint8[2]).to(torch.uint8)
+        
+        # 3. e_tot 계산 (uint8 제곱 오버플로우 재현)
+        # 제곱 연산 시 uint8 오버플로우가 발생하고, 합산 시 오버플로우를 막기 위해 long으로 캐스팅
+        e_tot = torch.sum((gray_uint8**2).long()) + 1e-8
+        
+        scores = []
+        # 4. 각 시그마 스케일에 대해 반복
+        for s1, s2 in sigmas:
+            # 4-1. PyTorch 기반 GaussianBlur 적용 (uint8 입력 -> uint8 출력)
+            blur1 = self._gaussian_blur_opencv_like_torch(gray_uint8, sigma=s1)
+            blur2 = self._gaussian_blur_opencv_like_torch(gray_uint8, sigma=s2)
+            
+            # 4-2. uint8 상태에서 DoG 계산 (wrap-around 뺄셈 재현)
+            dog = blur1 - blur2
+            
+            # 4-3. e_hf 계산 (uint8 제곱 오버플로우 재현)
+            e_hf = torch.sum((dog**2).long())
+            
+            # 4-4. 현재 스케일의 hf_score 계산 및 저장
+            scores.append(e_hf / e_tot)
+            
+        # 5. 가장 큰 점수와 점수 리스트 전체를 반환
+        max_score = torch.max(torch.tensor(scores)).item() if scores else 0.0
+        
+        return max_score, [s.item() for s in scores]
+
+    @torch.no_grad()
+    def _calculate_hf_score_torch(self, patch_tensor: torch.Tensor, sigma1: float = 1.0, sigma2: float = 3.0) -> float:
+        """
+        [PyTorch Version] NumPy/OpenCV 버전과 100% 동일한 결과를 내면서
+        GPU에서 모든 연산을 수행하여 속도를 향상시킨 단일 스케일 버전.
+        """
+        # 1. 텐서 준비 (Un-normalize 및 0-255 uint8 스케일링)
+        if patch_tensor.dim() == 4 and patch_tensor.shape[0] == 1:
+            patch_tensor = patch_tensor.squeeze(0)
+        unnormalized_tensor = self.unnorm(patch_tensor)
+
+        # 2. RGB to Grayscale 변환 (uint8)
+        img_uint8 = (unnormalized_tensor * 255).round().clamp(0, 255).to(torch.uint8)
+        gray_uint8 = (0.299 * img_uint8[0] + 0.587 * img_uint8[1] + 0.114 * img_uint8[2]).to(torch.uint8)
+        
+        # 3. PyTorch 기반 GaussianBlur 적용 (uint8 입력 -> uint8 출력)
+        blur1 = self._gaussian_blur_opencv_like_torch(gray_uint8, sigma=sigma1)
+        blur2 = self._gaussian_blur_opencv_like_torch(gray_uint8, sigma=sigma2)
+        
+        # 4. uint8 상태에서 DoG 계산 (wrap-around 뺄셈 재현)
+        dog = blur1 - blur2
+        
+        # 5. 에너지 비율 계산 (uint8 제곱 오버플로우 재현)
+        e_hf = torch.sum((dog**2).long())
+        e_tot = torch.sum((gray_uint8**2).long()) + 1e-8
+        hf_score = (e_hf / e_tot).item()
+
+        return hf_score
+
+    def _get_gaussian_kernel_torch(self, ksize: int, sigma: float, device: torch.device) -> torch.Tensor:
+        """PyTorch 1D 가우시안 커널을 생성합니다."""
+        center = ksize // 2
+        x = torch.arange(ksize, dtype=torch.float32, device=device) - center
+        kernel1d = torch.exp(-(x ** 2) / (2 * sigma ** 2))
+        return kernel1d / kernel1d.sum()
+
+    def _gaussian_blur_opencv_like_torch(self, x_uint8: torch.Tensor, sigma: float) -> torch.Tensor:
+        """
+        OpenCV와 동일하게 동작하는 PyTorch 기반 가우시안 블러.
+        uint8 텐서를 입력받아 uint8 텐서를 반환합니다.
+        """
+        # 1. OpenCV와 동일한 커널 크기 결정
+        ksize = int(round(sigma * 3)) * 2 + 1
+        
+        # 2. 커널 생성
+        kernel1d = self._get_gaussian_kernel_torch(ksize, sigma, x_uint8.device)
+        kernel2d = torch.outer(kernel1d, kernel1d).unsqueeze(0).unsqueeze(0) # [1, 1, ksize, ksize]
+        
+        # 3. uint8 텐서를 float32로 변환하여 컨볼루션 준비
+        x_float32 = x_uint8.float().unsqueeze(0).unsqueeze(0)
+
+        # 4. BORDER_REFLECT_101 방식의 패딩 적용
+        padding = ksize // 2
+        padded_x = F.pad(x_float32, (padding, padding, padding, padding), mode='reflect')
+        
+        # 5. 2D 컨볼루션으로 블러 적용
+        blurred_float = F.conv2d(padded_x, kernel2d, padding='valid').squeeze(0).squeeze(0)
+        
+        # 6. 다시 uint8 타입으로 변환하여 반환
+        return blurred_float.round().clamp(0, 255).to(torch.uint8)
+
+    @torch.no_grad()
+    def _calculate_hf_score_multiscale(self, patch_tensor: torch.Tensor, sigmas=[(1,2), (1,6), (4,8), (8,16), (16,32), (32,64)]) -> tuple[float, list[float]]:
+        """
+        [NEW] 여러 스케일의 DoG를 계산하여 가장 큰 hf_score와 각 스케일별 점수 리스트를 반환합니다.
+        사용자의 레퍼런스 코드와 동일하게 uint8 타입으로 DoG를 계산합니다.
+        """
+        # 1. 텐서를 NumPy 배열로 변환 (기존과 동일)
+        if patch_tensor.dim() == 4 and patch_tensor.shape[0] == 1:
+            patch_tensor = patch_tensor.squeeze(0)
+        patch_tensor = self.unnorm(patch_tensor)
+
+        img_np = patch_tensor.permute(1, 2, 0).cpu().numpy()
+        img_np = (img_np * 255).astype(np.uint8)
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        # 2. 흑백 변환 (결과는 uint8)
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        e_tot = np.sum(gray**2) + 1e-8
+        
+        scores = []
+        # 4. 각 시그마 스케일에 대해 반복
+        for s1, s2 in sigmas:
+            # 4-1. uint8 이미지에 GaussianBlur 적용
+            blur1 = cv2.GaussianBlur(gray, (0, 0), sigmaX=s1)
+            blur2 = cv2.GaussianBlur(gray, (0, 0), sigmaX=s2)
+            
+            # 4-2. uint8 상태에서 DoG 계산 (wrap-around 효과 재현)
+            dog = blur1 - blur2
+            
+            # 4-3. e_hf 계산 (float32로 변환 후)
+            e_hf = np.sum(dog**2)
+            
+            # 4-4. 현재 스케일의 hf_score 계산 및 저장
+            scores.append(e_hf / e_tot)
+            
+        # 5. 가장 큰 점수와 점수 리스트 전체를 반환
+        max_score = float(np.max(scores)) if scores else 0.0
+        
+        return max_score, scores
+
+    @torch.no_grad()
+    def _calculate_hf_score(self, patch_tensor: torch.Tensor, sigma1: float = 1.0, sigma2: float = 3.0) -> float:
+        """
+        [수정됨] PyTorch 텐서를 NumPy 배열로 변환하여 OpenCV의 GaussianBlur를 직접 사용하는 함수.
+        참고: 이 함수는 GPU->CPU 데이터 전송으로 인해 성능 저하가 발생할 수 있습니다.
+        """
+
+        # 1. 텐서 형태 확인 및 GPU 텐서를 CPU NumPy 배열로 변환
+        if patch_tensor.dim() == 4 and patch_tensor.shape[0] == 1:
+            patch_tensor = patch_tensor.squeeze(0) # [C, H, W]
+        patch_tensor = self.unnorm(patch_tensor)
+
+        # [C, H, W] -> [H, W, C] 형태로 변환하고 0-255 범위의 uint8 타입으로 변경
+        img_np = patch_tensor.permute(1, 2, 0).cpu().numpy()
+        img_np = (img_np * 255).astype(np.uint8)
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        # 2. OpenCV를 사용하여 흑백 변환
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+        # 3. OpenCV의 GaussianBlur 두 번 적용
+        blur1 = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma1)
+        blur2 = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma2)
+
+        # 4. DoG 계산 (float으로 변환하여 오버플로우 방지)
+        dog = blur1 - blur2
+        
+        # 5. NumPy를 사용하여 에너지 비율 계산
+        e_hf = np.sum(dog**2)
+        e_tot = np.sum(gray**2) + 1e-8
+        hf_score = float(e_hf / e_tot)
+
+        return hf_score
+
+    # @torch.no_grad()
+    # def _calculate_hf_score(self, patch_tensor: torch.Tensor, sigma1: float = 1.0, sigma2: float = 3.0) -> float:
+    #     """
+    #     주어진 이미지 패치(텐서)에 대해 DoG를 사용하여 high-frequency score를 계산합니다.
+    #     GPU-CPU 병목 현상을 피하기 위해 kornia 라이브러리를 사용합니다.
+    #     """
+    #     if patch_tensor.dim() == 3:
+    #         patch_tensor = patch_tensor.unsqueeze(0)
+        
+    #     patch_tensor = patch_tensor.float()
+    #     patch_tensor = patch_tensor * 255.0
+
+    #     gray_tensor = 0.299 * patch_tensor[:, 0:1, :, :] + 0.587 * patch_tensor[:, 1:2, :, :] + 0.114 * patch_tensor[:, 2:3, :, :]
+        
+    #     blur1 = gaussian_blur2d(gray_tensor, (int(6*sigma1+1), int(6*sigma1+1)), (sigma1, sigma1))
+    #     blur2 = gaussian_blur2d(gray_tensor, (int(6*sigma2+1), int(6*sigma2+1)), (sigma2, sigma2))
+
+    #     dog = blur1 - blur2
+        
+    #     e_hf = torch.sum(dog**2)
+    #     e_tot = torch.sum(gray_tensor**2) + 1e-8
+    #     hf_score = e_hf / e_tot
+    #     print(e_hf)
+    #     print(e_tot)
+
+    #     return hf_score.item()
+
+    def forward_feature(self, img, ref_dino, ref_clip, logit_size=None, ex_feats=None, last_feats=None, hf_score=None, num_sampled=None):
         
         if ex_feats is None:
             ex_feats = self.ref_feature_dino(img)
@@ -263,9 +468,17 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         elif self.model_type == 'GEM':
             image_features = self.net.visual(img)
         elif last_feats is not None:
-            image_features = self.net.encode_from_last_layer(last_feats, self.model_type, self.ignore_residual, output_cls_token=False, ex_feats=ex_feats, ref_dino=ref_dino, ref_clip=ref_clip)
+            image_features = self.net.encode_from_last_layer(
+                last_feats, self.model_type, self.ignore_residual, output_cls_token=False, 
+                ex_feats=ex_feats, ref_dino=ref_dino, ref_clip=ref_clip,
+                hf_score=hf_score, num_sampled=num_sampled
+            )
         else:
-            image_features = self.net.encode_image(img, self.model_type, self.ignore_residual, output_cls_token=False, ex_feats=ex_feats, ref_dino=ref_dino, ref_clip=ref_clip)#self.output_cls_token)  
+            image_features = self.net.encode_image(
+                img, self.model_type, self.ignore_residual, output_cls_token=False, 
+                ex_feats=ex_feats, ref_dino=ref_dino, ref_clip=ref_clip, 
+                hf_score=hf_score, num_sampled=num_sampled
+            ) 
         
         if self.output_cls_token:
             # image_cls_token, image_features = image_features
@@ -523,6 +736,16 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
 
         for h_idx in range(h_grids):
             for w_idx in range(w_grids):
+                # --- 현재 패치 crop 및 hf_score 계산 ---
+                y1, x1 = h_idx * h_stride, w_idx * w_stride
+                y2, x2 = min(y1 + h_crop, h_img), min(x1 + w_crop, w_img)
+                y1, x1 = max(y2 - h_crop, 0), max(x2 - w_crop, 0)
+                crop_img = img[:, :, y1:y2, x1:x2]
+                # hf_score = self._calculate_hf_score(crop_img)
+                hf_score = self._calculate_hf_score_torch(crop_img)
+                # hf_score, _ = self._calculate_hf_score_multiscale(crop_img)
+                # hf_score, _ = self._calculate_hf_score_multiscale_torch(crop_img)
+                
                 sampled_dino, sampled_clip = None, None
                 num_sampled = 0
 
@@ -552,7 +775,7 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                             member_indices = (labels == cid).nonzero(as_tuple=True)[0]
                             if len(member_indices) == 0: continue
                             
-                            torch.manual_seed = 42
+                            torch.manual_seed(42)
                             if len(member_indices) > M:
                                 rand_indices = member_indices[torch.randperm(len(member_indices), device=device)[:M]]
                             else:
@@ -603,7 +826,7 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                 if not use_sampling:
                     crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=None, last_feats=None) #internal_dino_feats
                 else:
-                    crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=None, last_feats=all_last_feats[patch_counter]) #internal_dino_feats
+                    crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=None, last_feats=all_last_feats[patch_counter], hf_score=hf_score, num_sampled=num_sampled) #internal_dino_feats
 
                 # --- 예측 결과에서 패딩 제거 ---
                 if any(pad):

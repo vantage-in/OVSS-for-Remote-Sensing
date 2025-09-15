@@ -499,7 +499,7 @@ class VisionTransformer(nn.Module):
 
         return pooled, tokens
 
-    def forward(self, x: torch.Tensor, model_type: str = 'ClearCLIP', ex_feats : torch.tensor = None, ignore_residual=True, output_cls_token=False, last_n_layers=1, ref_dino = None, ref_clip = None):
+    def forward(self, x: torch.Tensor, model_type: str = 'ClearCLIP', ex_feats : torch.tensor = None, ignore_residual=True, output_cls_token=False, last_n_layers=1, ref_dino = None, ref_clip = None, hf_score=None, num_sampled=None):
         B, nc, w, h = x.shape
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
@@ -546,11 +546,11 @@ class VisionTransformer(nn.Module):
 
             for blk in self.transformer.resblocks[-last_n_layers:]:
                 if ignore_residual:
-                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip) # ex_feats added
+                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled) # ex_feats added
 
                     x = blk(x)
                 else:
-                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type, ref_v=ref_clip)
+                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled)
                     x_out = x_out + blk.mlp(blk.ln_2(x_out))
                     output += x_out
             output = output[:784, :, :]
@@ -637,7 +637,7 @@ class VisionTransformer(nn.Module):
             out = torch.hstack([torch.zeros((dim1 * dim2 + 1, 1)), v_adjusted])
         return out
     
-    def custom_attn(self, attn_layer, x, ex_feats=None, model_type='ClearCLIP', ref_v=None):
+    def custom_attn(self, attn_layer, x, ex_feats=None, model_type='ClearCLIP', ref_v=None, hf_score=None, num_sampled=None):
         num_heads = attn_layer.num_heads
         num_tokens, bsz, embed_dim = x.size()
         # if ref_v is not None:
@@ -663,7 +663,6 @@ class VisionTransformer(nn.Module):
             if ref_v is not None:
                 beta = 1.5 # Openearthmap / Random Sample
                 beta = 1.6
-                # beat = 1.4
             else:
                 beta = 1.2
             gamma = 3.0
@@ -679,16 +678,133 @@ class VisionTransformer(nn.Module):
 
             q_k = F.normalize(ex_feats, dim=1) # [1, 768, 784]
             similarity = torch.einsum("b c m, b c n -> b m n", q_k, q_k) # [1, 784, 784]
-            
+
             similarity = (similarity - torch.mean(similarity) * beta) * gamma
+            
             if ref_v is not None:
                 similarity[similarity < 0.0] = float('-inf')
             else:
                 similarity[similarity < 0.0] = float('-inf')
 
-            mask = similarity.to(q.dtype).unsqueeze(1).repeat(1, num_heads, 1, 1)
-            mask = mask.reshape(bsz * num_heads, mask.shape[2], mask.shape[3])
-            attn_weights = F.softmax(mask, dim=-1) # [12, 784, 784]
+            ## --------------- (4) -------------
+            mask_pre = similarity.to(q.dtype).unsqueeze(1).repeat(1, num_heads, 1, 1)
+            mask_pre = mask_pre.reshape(bsz * num_heads, mask_pre.shape[2], mask_pre.shape[3])
+            attn_weights_pre = F.softmax(mask_pre, dim=-1)
+            
+            # print(hf_score)
+
+            if hf_score is not None and num_sampled is not None:
+                num_local_tokens = 784
+                global_start_index = num_local_tokens + num_sampled
+            
+                if global_start_index < attn_weights_pre.shape[1]:
+                    global_weight = 1.0 - hf_score
+                    final_sampling_weight = 1.0
+                    final_global_weight = 1.0
+            
+                    # gating_weight = global_weight * 2.0 # simple
+                    
+                    # temperature = 10.0
+                    # x = (global_weight - 0.5) * temperature
+                    # gating_weight = 2.0 * torch.sigmoid(torch.tensor(x, device=similarity.device))
+                    # # 가중치 벡터 생성 (기본값 1, global 부분만 gating_weight 적용)
+                    # weights = torch.ones(attn_weights_pre.shape[1], device=attn_weights_pre.device)
+                    # weights[global_start_index:] = gating_weight
+
+                    # temperature = 10.0
+                    # x = (global_weight - 0.5) * temperature
+                    # global_weight = torch.sigmoid(torch.tensor(x, device=similarity.device))
+                    # print(global_weight)
+
+                    if global_weight > 0.5:
+                        final_sampling_weight = (1.0 - global_weight) / global_weight
+                    else:
+                        final_global_weight = global_weight / (1.0 - global_weight)
+            
+                    weights = torch.ones(attn_weights_pre.shape[1], device=attn_weights_pre.device)
+                    if num_sampled > 0:
+                        weights[:global_start_index] = final_sampling_weight
+                    weights[global_start_index:] = final_global_weight
+            
+                    gating_multiplier = weights.unsqueeze(1) * weights.unsqueeze(0)
+            
+                    # 1차 Softmax 결과에 가중치 곱하기
+                    gated_attn_weights = attn_weights_pre * gating_multiplier.unsqueeze(0)
+                    
+                    # 다시 정규화 (Softmax 또는 단순 합으로 나누기)
+                    # attn_weights = F.softmax(gated_attn_weights, dim=-1) # Re-Softmax
+                    attn_weights = gated_attn_weights / (gated_attn_weights.sum(dim=-1, keepdim=True) + 1e-8) # Re-Normalization
+            else:
+                attn_weights = attn_weights_pre
+            # --------------- (4) -------------
+
+            # --------------- (NEW) -----------
+            # # 💡 [핵심 수정] 독립적인 Softmax 후 가중합 및 재정규화
+            # num_local_tokens = 784
+            # global_start_index = num_local_tokens + num_sampled
+
+            # # 2. Similarity 행렬을 internal, sampled, global 부분으로 슬라이싱
+            # # (Query는 항상 internal token 기준)
+            # sim_to_internal = similarity[:, :num_local_tokens, :num_local_tokens]
+            
+            # sim_to_sampled = None
+            # if num_sampled > 0:
+            #     sim_to_sampled = similarity[:, :num_local_tokens, num_local_tokens:global_start_index]
+
+            # sim_to_global = None
+            # if global_start_index < similarity.shape[1]:
+            #     sim_to_global = similarity[:, :num_local_tokens, global_start_index:]
+
+            # # 3. 각 부분에 대해 독립적으로 Softmax 적용
+            # attn_weights_internal = F.softmax(sim_to_internal, dim=-1)
+
+            # attn_weights_sampled = None
+            # if sim_to_sampled is not None:
+            #     attn_weights_sampled = F.softmax(sim_to_sampled, dim=-1)
+
+            # attn_weights_global = None
+            # if sim_to_global is not None:
+            #     attn_weights_global = F.softmax(sim_to_global, dim=-1)
+
+            # # 4. hf_score를 이용해 가중치 적용
+            # if hf_score is None: hf_score = 0.5 # hf_score가 없을 경우 기본값
+            
+            # # final_attn_frags = [attn_weights_internal]
+            # # if attn_weights_sampled is not None:
+            # #     final_attn_frags.append(hf_score * attn_weights_sampled)
+            # # if attn_weights_global is not None:
+            # #     final_attn_frags.append((1.0 - hf_score) * attn_weights_global)
+            
+            # global_weight = 1.0 - hf_score
+            # sampling_weight = 1.0
+
+            # if global_weight > 0.5:
+            #     # Global이 중요: Global 가중치는 1, Sampling 가중치는 비율로 계산
+            #     sampling_weight = (1.0 - global_weight) / global_weight
+            # else:
+            #     # Sampling이 중요: Sampling 가중치는 1, Global 가중치는 비율로 계산
+            #     global_weight = global_weight / (1.0 - global_weight)
+            
+            # # 5. 계산된 가중치 적용 및 결합
+            # final_attn_frags = [attn_weights_internal]
+            # if attn_weights_sampled is not None:
+            #     final_attn_frags.append(sampling_weight * attn_weights_sampled)
+            # if attn_weights_global is not None:
+            #     final_attn_frags.append(global_weight * attn_weights_global)
+
+            # final_attn = torch.cat(final_attn_frags, dim=-1)
+
+            # # 5. 가중합된 어텐션 가중치를 다시 정규화
+            # attn_weights_single_head = final_attn / (final_attn.sum(dim=-1, keepdim=True) + 1e-8)
+
+            # # 💡 6. [핵심 수정] 어텐션 가중치를 Multi-head에 맞게 확장
+            # attn_weights = attn_weights_single_head.unsqueeze(1).repeat(1, num_heads, 1, 1)
+            # attn_weights = attn_weights.reshape(bsz * num_heads, num_local_tokens, -1)
+            # --------------- (NEW) -----------
+
+            # mask = similarity.to(q.dtype).unsqueeze(1).repeat(1, num_heads, 1, 1)
+            # mask = mask.reshape(bsz * num_heads, mask.shape[2], mask.shape[3])
+            # attn_weights = F.softmax(mask, dim=-1) # [12, 784, 784]
 
             if ref_v is None:
                 v = v.reshape(bsz*num_heads, H_tok, W_tok, head_dim).permute(0, 3, 1, 2) 
@@ -750,7 +866,7 @@ class VisionTransformer(nn.Module):
             attn_weights += omega
             attn_weights = F.softmax(attn_weights, dim=-1)
 
-        attn_output = torch.bmm(attn_weights, v)
+        attn_output = torch.bmm(attn_weights.to(v.dtype), v)
         attn_output = attn_output.transpose(0, 1).contiguous().view(-1, bsz, embed_dim)
         attn_output = attn_layer.out_proj(attn_output)
 
@@ -843,7 +959,7 @@ class VisionTransformer(nn.Module):
 
         return v
 
-    def forward_from_last_layer(self, x: torch.Tensor, model_type: str = 'ClearCLIP', ex_feats : torch.tensor = None, ignore_residual=True, output_cls_token=False, last_n_layers=1, ref_dino = None, ref_clip = None):
+    def forward_from_last_layer(self, x: torch.Tensor, model_type: str = 'ClearCLIP', ex_feats : torch.tensor = None, ignore_residual=True, output_cls_token=False, last_n_layers=1, ref_dino = None, ref_clip = None, hf_score=None, num_sampled=None):
 
         if ex_feats is not None:
             ex_feats = ex_feats.flatten(2, 3)
@@ -868,11 +984,11 @@ class VisionTransformer(nn.Module):
 
             for blk in self.transformer.resblocks[-last_n_layers:]:
                 if ignore_residual:
-                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip) # ex_feats added
+                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled) # ex_feats added
 
                     x = blk(x)
                 else:
-                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type, ref_v=ref_clip)
+                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled)
                     x_out = x_out + blk.mlp(blk.ln_2(x_out))
                     output += x_out
             output = output[:784, :, :]
