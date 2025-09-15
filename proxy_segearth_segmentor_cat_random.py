@@ -625,13 +625,29 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         """
         [MODIFIED] Adds a `context_mode` option to control the context embeddings.
         Options for context_mode:
-        - 'sampling_and_global': Uses both sampled and global embeddings.
+        - 'dino_proxy': No additonal embeddings.
         - 'global_only': Uses only global embeddings.
         - 'sampling_only': Uses only sampled embeddings.
+        - 'sampling_and_global': Uses both sampled and global embeddings. (No gating)
+        - 'gating': Single-scale gating for global embeddings.
+        - 'multiscale_gating': Multi-scale gating for global embeddings.
         """
         printing = False
+
         use_global = 'global' in context_mode
         use_sampling = 'sampling' in context_mode
+        use_gating = 'gating' in context_mode
+        use_multiscale_gating = 'multiscale' in context_mode
+        if 'gating' in context_mode:
+            use_global = True
+            use_sampling = True
+
+        if printing:
+            print("Printing the context mode:")
+            print(f" - Using inter-region information: {use_sampling}")
+            print(f" - Using global information: {use_global}")
+            print(f" - Using gating for global information: {use_gating}")
+            print(f" - Using multi-scale gating for global information: {use_multiscale_gating}")
 
         if type(img) == list:
             img = img[0].unsqueeze(0)
@@ -670,8 +686,6 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         # ========================================================================
         # Phase 1: Collect and sample patch features if needed
         # ========================================================================
-        
-
         all_last_feats = []
 
         all_robust_dino_feats, all_robust_clip_feats, all_robust_patch_ids = None, None, None
@@ -741,10 +755,16 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                 y2, x2 = min(y1 + h_crop, h_img), min(x1 + w_crop, w_img)
                 y1, x1 = max(y2 - h_crop, 0), max(x2 - w_crop, 0)
                 crop_img = img[:, :, y1:y2, x1:x2]
-                # hf_score = self._calculate_hf_score(crop_img)
-                hf_score = self._calculate_hf_score_torch(crop_img)
-                # hf_score, _ = self._calculate_hf_score_multiscale(crop_img)
-                # hf_score, _ = self._calculate_hf_score_multiscale_torch(crop_img)
+
+                if use_gating:
+                    if use_multiscale_gating:
+                        # hf_score, _ = self._calculate_hf_score_multiscale(crop_img)
+                        hf_score, _ = self._calculate_hf_score_multiscale_torch(crop_img)
+                    else:
+                        # hf_score = self._calculate_hf_score(crop_img)
+                        hf_score = self._calculate_hf_score_torch(crop_img)
+                else:
+                    hf_score = None
                 
                 sampled_dino, sampled_clip = None, None
                 num_sampled = 0
@@ -784,7 +804,6 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                             dino_samples.append(external_dino_feats[rand_indices])
                             clip_samples.append(external_clip_feats[rand_indices])
                         
-                    # 여기서부터
                     if dino_samples:
                         sampled_dino = torch.cat(dino_samples, dim=0)
                         sampled_clip = torch.cat(clip_samples, dim=0)
