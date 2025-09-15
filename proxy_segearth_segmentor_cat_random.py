@@ -573,7 +573,7 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
             v = v.transpose(1, 2).reshape(nb_im, nb_tokens, -1)[:, 1:, :]
 
             patch_size = self.vfm.patch_embed.patch_size
-            I, J = imgs_norm[0].shape[-2] // patch_size, imgs_norm[0].shape[-2] // patch_size
+            I, J = imgs_norm[0].shape[-2] // patch_size, imgs_norm[0].shape[-1] // patch_size
 
             # ex_feats = q.reshape(nb_im, I, J, -1).permute(0, 3, 1, 2)
             # ex_feats = k.reshape(nb_im, I, J, -1).permute(0, 3, 1, 2)
@@ -581,7 +581,7 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
             ex_feats = feat[:, 1:, :].reshape(nb_im, I, J, -1).permute(0, 3, 1, 2)
         elif self.vfm_model == 'dinov2':
             patch_size = self.vfm.patch_embed.patch_size
-            I, J = imgs_norm.shape[-2] // patch_size[0], imgs_norm.shape[-2] // patch_size[1]
+            I, J = imgs_norm.shape[-2] // patch_size[0], imgs_norm.shape[-1] // patch_size[1]
             ex_feats = self.vfm.get_intermediate_layers(imgs_norm, reshape=True)[0]
         elif self.vfm_model == 'mae':
             patch_size = self.vfm.patch_embed.patch_size
@@ -621,7 +621,7 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         return seg_pred.squeeze(0) # [28, 28]
 
     # Best
-    def forward_slide(self, img, img_metas, stride=112, crop_size=224, context_mode='sampling_and_global'):
+    def forward_slide(self, img, img_metas, stride=112, crop_size=224, context_mode='multiscale_gating'):
         """
         [MODIFIED] Adds a `context_mode` option to control the context embeddings.
         Options for context_mode:
@@ -883,6 +883,8 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                                       padding_size=[0, 0, 0, 0])
                               ] * inputs.shape[0]
         inputs = inputs.half()
+        print(f"image size: {inputs.shape}")
+        print(data_samples[0].metainfo)
         if self.slide_crop > 0:
             seg_logits = self.forward_slide(inputs, batch_img_metas, self.slide_stride, self.slide_crop)
         else:
