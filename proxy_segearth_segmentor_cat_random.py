@@ -896,8 +896,8 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                                       padding_size=[0, 0, 0, 0])
                               ] * inputs.shape[0]
         inputs = inputs.half()
-        print(f"image size: {inputs.shape}")
-        print(data_samples[0].metainfo)
+        # print(f"image size: {inputs.shape}")
+        # print(data_samples[0].metainfo)
         if self.slide_crop > 0:
             seg_logits = self.forward_slide(inputs, batch_img_metas, self.slide_stride, self.slide_crop)
         else:
