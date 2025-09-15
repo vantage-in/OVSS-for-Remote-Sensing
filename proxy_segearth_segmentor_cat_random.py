@@ -842,10 +842,12 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                 else:
                     padded_crop_img = crop_img
 
+                H_pad, W_pad = padded_crop_img.shape[-2:]
+
                 if not use_sampling:
-                    crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=None, last_feats=None) #internal_dino_feats
+                    crop_seg_logit = self.forward_feature(padded_crop_img, W_pad, H_pad, ref_dino, ref_clip, ex_feats=None, last_feats=None) #internal_dino_feats
                 else:
-                    crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=None, last_feats=all_last_feats[patch_counter], hf_score=hf_score, num_sampled=num_sampled) #internal_dino_feats
+                    crop_seg_logit = self.forward_feature(padded_crop_img, W_pad, H_pad, ref_dino, ref_clip, ex_feats=None, last_feats=all_last_feats[patch_counter], hf_score=hf_score, num_sampled=num_sampled) #internal_dino_feats
 
                 # --- 예측 결과에서 패딩 제거 ---
                 if any(pad):

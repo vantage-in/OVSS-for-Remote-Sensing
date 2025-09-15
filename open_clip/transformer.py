@@ -519,6 +519,9 @@ class VisionTransformer(nn.Module):
 
         x = x.permute(1, 0, 2)  # NLD -> LND
 
+        H_tok = h // self.patch_size[0]
+        W_tok = w // self.patch_size[1]
+
         for blk in self.transformer.resblocks[:-last_n_layers]:
             x = blk(x)
 
@@ -530,11 +533,11 @@ class VisionTransformer(nn.Module):
         if ref_dino is None:
             for blk in self.transformer.resblocks[-last_n_layers:]:
                 if ignore_residual:
-                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type) # ex_feats added
+                    output += self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, ex_feats=ex_feats, model_type=model_type) # ex_feats added
 
                     x = blk(x)
                 else:
-                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type)
+                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, model_type=model_type)
                     x_out = x_out + blk.mlp(blk.ln_2(x_out))
                     output += x_out
 
@@ -546,11 +549,11 @@ class VisionTransformer(nn.Module):
 
             for blk in self.transformer.resblocks[-last_n_layers:]:
                 if ignore_residual:
-                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled) # ex_feats added
+                    output += self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled) # ex_feats added
 
                     x = blk(x)
                 else:
-                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled)
+                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled)
                     x_out = x_out + blk.mlp(blk.ln_2(x_out))
                     output += x_out
             output = output[:784, :, :]
@@ -637,15 +640,15 @@ class VisionTransformer(nn.Module):
             out = torch.hstack([torch.zeros((dim1 * dim2 + 1, 1)), v_adjusted])
         return out
     
-    def custom_attn(self, attn_layer, x, ex_feats=None, model_type='ClearCLIP', ref_v=None, hf_score=None, num_sampled=None):
+    def custom_attn(self, attn_layer, x, H_tok, W_tok, ex_feats=None, model_type='ClearCLIP', ref_v=None, hf_score=None, num_sampled=None):
         num_heads = attn_layer.num_heads
         num_tokens, bsz, embed_dim = x.size()
         # if ref_v is not None:
         #     num_tokens = num_tokens//2
         head_dim = embed_dim // num_heads
         scale = head_dim ** -0.5
-        H_tok = W_tok = int((num_tokens - 1) ** 0.5)
-        assert H_tok * W_tok == num_tokens - 1, f"token grid is not square {num_tokens} – handle here if needed"
+        # H_tok = W_tok = int((num_tokens - 1) ** 0.5)
+        # assert H_tok * W_tok == num_tokens - 1, f"token grid is not square {num_tokens} – handle here if needed"
         
         if ref_v is None:
             q, k, v = F.linear(x, attn_layer.in_proj_weight, attn_layer.in_proj_bias).chunk(3, dim=-1)
@@ -913,8 +916,11 @@ class VisionTransformer(nn.Module):
             num_tokens, bsz, embed_dim = x.size()
             head_dim = embed_dim // num_heads
             scale = head_dim ** -0.5
-            H_tok = W_tok = int((num_tokens - 1) ** 0.5)
-            assert H_tok * W_tok == num_tokens - 1, "token grid is not square – handle here if needed"
+            
+            H_tok = h // self.patch_size[0]
+            W_tok = w // self.patch_size[1]
+            # H_tok = W_tok = int((num_tokens - 1) ** 0.5)
+            # assert H_tok * W_tok == num_tokens - 1, "token grid is not square – handle here if needed"
             
             _, _, val = F.linear(x, blk.attn.in_proj_weight, blk.attn.in_proj_bias).chunk(3, dim=-1)
             v += val
@@ -949,7 +955,7 @@ class VisionTransformer(nn.Module):
 
         return x
 
-    def value_projection(self, x: torch.Tensor, last_n_layers=1):
+    def value_projection(self, x: torch.Tensor, H_tok: int, W_tok: int, last_n_layers=1):
         v = 0
         for blk in self.transformer.resblocks[-last_n_layers:]:
             x = blk.ln_1(x)
@@ -958,8 +964,8 @@ class VisionTransformer(nn.Module):
             num_tokens, bsz, embed_dim = x.size()
             head_dim = embed_dim // num_heads
             scale = head_dim ** -0.5
-            H_tok = W_tok = int((num_tokens - 1) ** 0.5)
-            assert H_tok * W_tok == num_tokens - 1, "token grid is not square – handle here if needed"
+            # H_tok = W_tok = int((num_tokens - 1) ** 0.5)
+            # assert H_tok * W_tok == num_tokens - 1, "token grid is not square – handle here if needed"
             
             _, _, val = F.linear(x, blk.attn.in_proj_weight, blk.attn.in_proj_bias).chunk(3, dim=-1)
             v += val
@@ -969,7 +975,9 @@ class VisionTransformer(nn.Module):
 
         return v
 
-    def forward_from_last_layer(self, x: torch.Tensor, model_type: str = 'ClearCLIP', ex_feats : torch.tensor = None, ignore_residual=True, output_cls_token=False, last_n_layers=1, ref_dino = None, ref_clip = None, hf_score=None, num_sampled=None):
+    def forward_from_last_layer(self, x: torch.Tensor, w: int, h: int, model_type: str = 'ClearCLIP', ex_feats : torch.tensor = None, ignore_residual=True, output_cls_token=False, last_n_layers=1, ref_dino = None, ref_clip = None, hf_score=None, num_sampled=None):
+        H_tok = h // self.patch_size[0]
+        W_tok = w // self.patch_size[1]
 
         if ex_feats is not None:
             ex_feats = ex_feats.flatten(2, 3)
@@ -978,11 +986,11 @@ class VisionTransformer(nn.Module):
         if ref_dino is None:
             for blk in self.transformer.resblocks[-last_n_layers:]:
                 if ignore_residual:
-                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type) # ex_feats added
+                    output += self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, ex_feats=ex_feats, model_type=model_type) # ex_feats added
 
                     x = blk(x)
                 else:
-                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type)
+                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, model_type=model_type)
                     x_out = x_out + blk.mlp(blk.ln_2(x_out))
                     output += x_out
 
@@ -994,11 +1002,11 @@ class VisionTransformer(nn.Module):
 
             for blk in self.transformer.resblocks[-last_n_layers:]:
                 if ignore_residual:
-                    output += self.custom_attn(blk.attn, blk.ln_1(x), ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled) # ex_feats added
+                    output += self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled) # ex_feats added
 
                     x = blk(x)
                 else:
-                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled)
+                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled)
                     x_out = x_out + blk.mlp(blk.ln_2(x_out))
                     output += x_out
             output = output[:784, :, :]
