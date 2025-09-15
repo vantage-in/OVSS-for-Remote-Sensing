@@ -20,3 +20,4 @@ adaptive_conv_cpp_impl.cpython-39-x86_64-linux-gnu.so
 adaptive_conv_cpp_impl.cpython-310-x86_64-linux-gnu.so
 adaptive_conv_cuda_impl.cpython-39-x86_64-linux-gnu.so
 adaptive_conv_cuda_impl.cpython-310-x86_64-linux-gnu.so
+demo/
