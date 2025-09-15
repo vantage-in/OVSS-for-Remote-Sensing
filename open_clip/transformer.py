@@ -500,7 +500,7 @@ class VisionTransformer(nn.Module):
         return pooled, tokens
 
     def forward(self, x: torch.Tensor, model_type: str = 'ClearCLIP', ex_feats : torch.tensor = None, ignore_residual=True, output_cls_token=False, last_n_layers=1, ref_dino = None, ref_clip = None, hf_score=None, num_sampled=None):
-        B, nc, w, h = x.shape
+        B, nc, h, w = x.shape
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -510,7 +510,7 @@ class VisionTransformer(nn.Module):
         # shape = [*, grid ** 2 + 1, width]
 
         if x.shape[1] != self.positional_embedding.shape[0]:
-            x = x + self.interpolate_pos_encoding(x, w, h).to(x.dtype)
+            x = x + self.interpolate_pos_encoding(x, h, w).to(x.dtype)
         else:
             x = x + self.positional_embedding.to(x.dtype)
 
@@ -524,9 +524,6 @@ class VisionTransformer(nn.Module):
 
         for blk in self.transformer.resblocks[:-last_n_layers]:
             x = blk(x)
-
-        if ex_feats is not None:
-            ex_feats = ex_feats.flatten(2, 3)
 
         output = 0
 
@@ -545,18 +542,17 @@ class VisionTransformer(nn.Module):
         elif ref_dino is not None:
             # Required: [1, 768, 784]
             # ex_feats도 normalize를 해야 하나?
-            ex_feats = torch.cat([ex_feats, ref_dino], dim=-1)
 
             for blk in self.transformer.resblocks[-last_n_layers:]:
                 if ignore_residual:
-                    output += self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled) # ex_feats added
+                    output += self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, ex_feats=ex_feats, model_type=model_type, ref_dino=ref_dino, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled) # ex_feats added
 
                     x = blk(x)
                 else:
-                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled)
+                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, model_type=model_type, ref_dino=ref_dino, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled)
                     x_out = x_out + blk.mlp(blk.ln_2(x_out))
                     output += x_out
-            output = output[:784, :, :]
+            output = output[:ex_feats.shape[-2]*ex_feats.shape[-1], :, :]
 
         x = output.permute(1, 0, 2)  # LND -> NLD
         if ex_feats is not None:
@@ -640,7 +636,7 @@ class VisionTransformer(nn.Module):
             out = torch.hstack([torch.zeros((dim1 * dim2 + 1, 1)), v_adjusted])
         return out
     
-    def custom_attn(self, attn_layer, x, H_tok, W_tok, ex_feats=None, model_type='ClearCLIP', ref_v=None, hf_score=None, num_sampled=None):
+    def custom_attn(self, attn_layer, x, H_tok, W_tok, ex_feats=None, model_type='ClearCLIP', ref_dino=None, ref_v=None, hf_score=None, num_sampled=None):
         num_heads = attn_layer.num_heads
         num_tokens, bsz, embed_dim = x.size()
         # if ref_v is not None:
@@ -667,10 +663,12 @@ class VisionTransformer(nn.Module):
             # ex_feats = F.interpolate(ex_feats, size=(H_tok, W_tok),
             #                      mode='bilinear', align_corners=False)
 
-            B, C, N = ex_feats.shape # [1, 768, 28, 28]
-            if ref_v is not None:
-                N = 784
-            H = W = int(np.sqrt(N))
+            B, C, H, W = ex_feats.shape # [1, 768, 28, 28]
+            N = H*W
+
+            ex_feats = ex_feats.flatten(2, 3)
+            if ref_dino is not None:
+                ex_feats = torch.cat([ex_feats, ref_dino], dim=-1)
 
             if num_sampled is None:
                 num_sampled = 0
@@ -707,7 +705,7 @@ class VisionTransformer(nn.Module):
             # print(hf_score)
 
             if hf_score is not None and num_sampled is not None:
-                num_local_tokens = 784
+                num_local_tokens = N
                 global_start_index = num_local_tokens + num_sampled
             
                 if global_start_index < attn_weights_pre.shape[1]:
@@ -886,7 +884,7 @@ class VisionTransformer(nn.Module):
         return attn_output
 
     def forward_last_layer(self, x: torch.Tensor, last_n_layers=1):
-        B, nc, w, h = x.shape
+        B, nc, h, w = x.shape
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -896,7 +894,7 @@ class VisionTransformer(nn.Module):
         # shape = [*, grid ** 2 + 1, width]
 
         if x.shape[1] != self.positional_embedding.shape[0]:
-            x = x + self.interpolate_pos_encoding(x, w, h).to(x.dtype)
+            x = x + self.interpolate_pos_encoding(x, h, w).to(x.dtype)
         else:
             x = x + self.positional_embedding.to(x.dtype)
 
@@ -931,7 +929,7 @@ class VisionTransformer(nn.Module):
         return v
 
     def last_layer_input(self, x: torch.Tensor, last_n_layers=1):
-        B, nc, w, h = x.shape
+        B, nc, h, w = x.shape
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -941,7 +939,7 @@ class VisionTransformer(nn.Module):
         # shape = [*, grid ** 2 + 1, width]
 
         if x.shape[1] != self.positional_embedding.shape[0]:
-            x = x + self.interpolate_pos_encoding(x, w, h).to(x.dtype)
+            x = x + self.interpolate_pos_encoding(x, h, w).to(x.dtype)
         else:
             x = x + self.positional_embedding.to(x.dtype)
 
@@ -955,7 +953,7 @@ class VisionTransformer(nn.Module):
 
         return x
 
-    def value_projection(self, x: torch.Tensor, H_tok: int, W_tok: int, last_n_layers=1):
+    def value_projection(self, x: torch.Tensor, H_tok: int, W_tok: int, last_n_layers=1, target_size=(28, 28)):
         v = 0
         for blk in self.transformer.resblocks[-last_n_layers:]:
             x = blk.ln_1(x)
@@ -971,16 +969,13 @@ class VisionTransformer(nn.Module):
             v += val
             v = v[1:, :, :].contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
             v = v.reshape(bsz*num_heads, H_tok, W_tok, head_dim).permute(0, 3, 1, 2) 
-            v = F.interpolate(v, size=(28, 28), mode='bilinear', align_corners=False)
+            v = F.interpolate(v, size=target_size, mode='bilinear', align_corners=False)
 
         return v
 
-    def forward_from_last_layer(self, x: torch.Tensor, w: int, h: int, model_type: str = 'ClearCLIP', ex_feats : torch.tensor = None, ignore_residual=True, output_cls_token=False, last_n_layers=1, ref_dino = None, ref_clip = None, hf_score=None, num_sampled=None):
+    def forward_from_last_layer(self, x: torch.Tensor, h: int, w: int, model_type: str = 'ClearCLIP', ex_feats : torch.tensor = None, ignore_residual=True, output_cls_token=False, last_n_layers=1, ref_dino = None, ref_clip = None, hf_score=None, num_sampled=None):
         H_tok = h // self.patch_size[0]
         W_tok = w // self.patch_size[1]
-
-        if ex_feats is not None:
-            ex_feats = ex_feats.flatten(2, 3)
 
         output = 0
         if ref_dino is None:
@@ -998,18 +993,17 @@ class VisionTransformer(nn.Module):
         elif ref_dino is not None:
             # Required: [1, 768, 784]
             # ex_feats도 normalize를 해야 하나?
-            ex_feats = torch.cat([ex_feats, ref_dino], dim=-1)
 
             for blk in self.transformer.resblocks[-last_n_layers:]:
                 if ignore_residual:
-                    output += self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, ex_feats=ex_feats, model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled) # ex_feats added
+                    output += self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, ex_feats=ex_feats, model_type=model_type, ref_dino=ref_dino, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled) # ex_feats added
 
                     x = blk(x)
                 else:
-                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, model_type=model_type, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled)
+                    x_out = x + self.custom_attn(blk.attn, blk.ln_1(x), H_tok, W_tok, model_type=model_type, ref_dino=ref_dino, ref_v=ref_clip, hf_score=hf_score, num_sampled=num_sampled)
                     x_out = x_out + blk.mlp(blk.ln_2(x_out))
                     output += x_out
-            output = output[:784, :, :]
+            output = output[:ex_feats.shape[-2]*ex_feats.shape[-1], :, :]
 
         x = output.permute(1, 0, 2)  # LND -> NLD
         if ex_feats is not None:

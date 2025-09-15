@@ -288,11 +288,13 @@ class CLIP(nn.Module):
         # Return the input of the last layer
         return self.visual.last_layer_input(image)
 
-    def encode_value_projection(self, x):
-        return self.visual.value_projection(x)
+    def encode_value_projection(self, x, h, w, target_size=(28, 28)):
+        return self.visual.value_projection(x, h, w, target_size=target_size)
 
     def encode_from_last_layer(self,
-                     image,
+                     feats,
+                     h,
+                     w,
                      model_type,
                      ignore_residual: bool = False,
                      output_cls_token: bool = False,
@@ -301,7 +303,7 @@ class CLIP(nn.Module):
                      ref_clip: torch.tensor = None,
                      hf_score=None, 
                      num_sampled=None):
-        return self.visual.forward_from_last_layer(image, model_type, ex_feats, ignore_residual, output_cls_token, ref_dino=ref_dino, ref_clip=ref_clip, hf_score=hf_score, num_sampled=num_sampled)
+        return self.visual.forward_from_last_layer(feats, h, w, model_type, ex_feats, ignore_residual, output_cls_token, ref_dino=ref_dino, ref_clip=ref_clip, hf_score=hf_score, num_sampled=num_sampled)
 
     def encode_text(self, text, normalize: bool = False):
         cast_dtype = self.transformer.get_cast_dtype()

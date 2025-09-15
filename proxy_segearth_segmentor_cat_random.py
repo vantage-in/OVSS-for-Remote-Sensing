@@ -336,6 +336,15 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         # 1. OpenCV와 동일한 커널 크기 결정
         ksize = int(round(sigma * 3)) * 2 + 1
         
+        # 💡 --- 핵심 수정: 커널 크기 제한 ---
+        # 입력 텐서의 높이와 너비 가져오기
+        h, w = x_uint8.shape[-2:]
+        # ksize가 높이나 너비보다 크지 않도록 제한하고, 홀수로 유지
+        ksize = min(ksize, h - 1, w - 1)
+        ksize = ksize if ksize % 2 != 0 else ksize - 1
+        ksize = max(ksize, 1)
+        # --- 여기까지 수정 ---
+
         # 2. 커널 생성
         kernel1d = self._get_gaussian_kernel_torch(ksize, sigma, x_uint8.device)
         kernel2d = torch.outer(kernel1d, kernel1d).unsqueeze(0).unsqueeze(0) # [1, 1, ksize, ksize]
@@ -455,7 +464,8 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
     #     return hf_score.item()
 
     def forward_feature(self, img, ref_dino, ref_clip, logit_size=None, ex_feats=None, last_feats=None, hf_score=None, num_sampled=None):
-        
+        h, w = img.shape[-2:]
+
         if ex_feats is None:
             ex_feats = self.ref_feature_dino(img)
         
@@ -469,7 +479,7 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
             image_features = self.net.visual(img)
         elif last_feats is not None:
             image_features = self.net.encode_from_last_layer(
-                last_feats, self.model_type, self.ignore_residual, output_cls_token=False, 
+                last_feats, h, w, self.model_type, self.ignore_residual, output_cls_token=False, 
                 ex_feats=ex_feats, ref_dino=ref_dino, ref_clip=ref_clip,
                 hf_score=hf_score, num_sampled=num_sampled
             )
@@ -488,11 +498,10 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
 
         # featup
         if self.feature_up:
-            #feature_w, feature_h = img[0].shape[-2] // self.patch_size[0], img[0].shape[-1] // self.patch_size[1]
-            feature_w, feature_h = img[0].shape[-2] // self.dino_patch_size, img[0].shape[-1] // self.dino_patch_size
-            image_w, image_h = img[0].shape[-2], img[0].shape[-1]
+            feature_h, feature_w = img[0].shape[-2] // self.dino_patch_size, img[0].shape[-1] // self.dino_patch_size
+            image_h, image_w = img[0].shape[-2], img[0].shape[-1]
             # image_features = image_features.permute(0, 2, 1).view(1, self.feat_dim, feature_w, feature_h)
-            image_features = image_features.permute(0, 2, 1).view(1, self.feat_dim, feature_w, feature_h)
+            image_features = image_features.permute(0, 2, 1).view(1, self.feat_dim, feature_h, feature_w)
             with torch.cuda.amp.autocast():
                 # --- Upsample with refinement ---
                 # image_features = self.upsampler.up2(image_features, img).half() # [1, 512, 28, 28]
@@ -506,7 +515,7 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                 image_features = self.upsampler.fixup(image_features).half()
                 # -------------------------------- 
 
-            image_features = image_features.view(1, self.feat_dim, image_w * image_h).permute(0, 2, 1)
+            image_features = image_features.view(1, self.feat_dim, image_h * image_w).permute(0, 2, 1)
 
         image_features /= image_features.norm(dim=-1, keepdim=True)
         logits = image_features @ self.query_features.T
@@ -515,18 +524,18 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
             logits = logits + cls_logits * self.cls_token_lambda
 
         if self.feature_up:
-            w, h = img[0].shape[-2], img[0].shape[-1]
+            h, w = img[0].shape[-2], img[0].shape[-1]
         else:
-            w, h = img[0].shape[-2] // self.patch_size[0], img[0].shape[-1] // self.patch_size[1]
+            h, w = img[0].shape[-2] // self.patch_size[0], img[0].shape[-1] // self.patch_size[1]
         out_dim = logits.shape[-1]
 
         # for proxy and not featup only
         # if self.vfm_model is not None:
         #     logits = logits.permute(0, 2, 1).reshape(-1, out_dim, I, J)
         # else:
-        #     logits = logits.permute(0, 2, 1).reshape(-1, out_dim, w, h)
+        #     logits = logits.permute(0, 2, 1).reshape(-1, out_dim, h, w)
         # Original
-        logits = logits.permute(0, 2, 1).reshape(-1, out_dim, w, h)
+        logits = logits.permute(0, 2, 1).reshape(-1, out_dim, h, w)
 
         if logit_size == None:
             logits = nn.functional.interpolate(logits, size=img.shape[-2:], mode='bilinear')
@@ -671,10 +680,11 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
             if printing: print("Phase 0: Extracting global context features...")
             with torch.no_grad():
                 global_view_img = F.interpolate(img, size=(224, 224), mode='bilinear', align_corners=False)
-                
+                h_gl_tok, w_gl_tok = global_view_img.shape[-2] // self.patch_size[0], global_view_img.shape[-1] // self.patch_size[1]
+
                 x_global = self.net.encode_before_last_layer(global_view_img)
                 global_dino_feats = self.ref_feature_dino(global_view_img)
-                global_clip_feats = self.net.encode_value_projection(x_global)
+                global_clip_feats = self.net.encode_value_projection(x_global, h_gl_tok, w_gl_tok)
 
                 global_dino_feats_flat = global_dino_feats.flatten(2, 3).permute(0, 2, 1).reshape(-1, global_dino_feats.shape[1])
                 global_clip_feats_flat = global_clip_feats.flatten(2, 3).permute(2, 0, 1).reshape(-1, global_clip_feats.shape[0] * global_clip_feats.shape[1])
@@ -715,8 +725,11 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                     x = self.net.encode_before_last_layer(padded_img)
                     all_last_feats.append(x)
 
+                    h_pad_tok, w_pad_tok = padded_img.shape[-2] // self.patch_size[0], padded_img.shape[-1] // self.patch_size[1]
+
                     dino_feat = self.ref_feature_dino(padded_img) # 원래는 여기 pad 안한 걸 썼음 (전달용)
-                    clip_feat = self.net.encode_value_projection(x)
+                    target_h, target_w = dino_feat.shape[-2:]
+                    clip_feat = self.net.encode_value_projection(x, h_pad_tok, w_pad_tok, target_size=(target_h, target_w))
 
                     dino_feat_flat = dino_feat.flatten(2, 3).permute(0, 2, 1).reshape(-1, dino_feat.shape[1])
                     clip_feat_flat = clip_feat.flatten(2, 3).permute(2, 0, 1).reshape(-1, clip_feat.shape[0] * clip_feat.shape[1])
@@ -842,12 +855,10 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                 else:
                     padded_crop_img = crop_img
 
-                H_pad, W_pad = padded_crop_img.shape[-2:]
-
                 if not use_sampling:
-                    crop_seg_logit = self.forward_feature(padded_crop_img, W_pad, H_pad, ref_dino, ref_clip, ex_feats=None, last_feats=None) #internal_dino_feats
+                    crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=None, last_feats=None) #internal_dino_feats
                 else:
-                    crop_seg_logit = self.forward_feature(padded_crop_img, W_pad, H_pad, ref_dino, ref_clip, ex_feats=None, last_feats=all_last_feats[patch_counter], hf_score=hf_score, num_sampled=num_sampled) #internal_dino_feats
+                    crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=None, last_feats=all_last_feats[patch_counter], hf_score=hf_score, num_sampled=num_sampled) #internal_dino_feats
 
                 # --- 예측 결과에서 패딩 제거 ---
                 if any(pad):
