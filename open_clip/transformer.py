@@ -687,6 +687,23 @@ class VisionTransformer(nn.Module):
                 beta = 1.2
             gamma = 3.0
 
+            # # ---------------- DINO v2 ------------------
+            # if ref_v is not None:
+            #     if num_sampled == 0: # global only
+            #         beta = 1.3
+            #     elif N + num_sampled == ex_feats.shape[-1]: # sampling only
+            #         beta = 1.4
+            #     elif N + num_sampled < ex_feats.shape[-1]: # sampling and global
+            #         beta = 1.4
+            #         # print(beta)
+            #     else:
+            #         beta = 1.2
+            #         print("no way")
+            # else: # DINO proxy
+            #     beta = 1.2
+            # gamma = 3.0
+            # # ---------------- DINO v2 ------------------
+
             q_k = F.normalize(ex_feats, dim=1) # [1, 768, 784]
             similarity = torch.einsum("b c m, b c n -> b m n", q_k, q_k) # [1, 784, 784]
 

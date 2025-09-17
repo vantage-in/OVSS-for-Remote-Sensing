@@ -4,7 +4,10 @@ import matplotlib.pyplot as plt
 from torchvision import transforms
 import numpy as np
 import matplotlib.colors as mcolors
+import matplotlib.patches as mpatches
 from pathlib import Path
+import random
+import shutil
 
 # --- Import Model Classes ---
 from segearth_segmentor import SegEarthSegmentation
@@ -15,25 +18,26 @@ from proxy_segearth_segmentor_cat_random import ProxySegEarthSegmentationCatRand
 MODEL_CHOICE = 'both' 
 
 # Set directories for input
-IMAGE_DIR = Path('data/OpenEarthMap/img_dir/val/')
+IMAGE_DIR = Path('data/LoveDA/img_dir/val')
 # Updated LABEL_DIR to the new path
-LABEL_DIR = Path('data/OpenEarthMap/ann_dir/val/')
-BASE_OUTPUT_DIR = Path('present/openearthmap')
+LABEL_DIR = Path('data/LoveDA/ann_dir/val')
+BASE_OUTPUT_DIR = Path('present/loveda')
 
 # Option to process label files. Set to False to disable.
-PROCESS_LABELS = False
+PROCESS_LABELS = True
+
+# Num of sampling
+NUM_SAMPLES = 100
 
 # --- 2. Define Color Map for Visualization ---
 class_info = {
-    0: ("Background", "#000000"),
-    1: ("Bareland", "#800000"),
-    2: ("Rangeland (grass)", "#00FF24"),
-    3: ("Developed space (pavement)", "#949494"),
-    4: ("Road", "#FFFFFF"),
-    5: ("Tree", "#226126"),
-    6: ("Water", "#0045FF"),
-    7: ("Agriculture land (cropland)", "#4BB549"),
-    8: ("Building", "#DE1F07"),
+    0: ("background", "#000000"),                # 네이비
+    1: ("building", "#DE1F07"),          # 청록 (Teal)
+    2: ("road", "#FFFFFF"),    # 노랑
+    3: ("water", "#0045FF"),        # 연두 (GreenYellow)
+    4: ("barren", "#800000"),    # 주황
+    5: ("forest", "#226126"),  # 빨강
+    6: ("agriculture", "#4BB549")         
 }
 colors = [mcolors.hex2color(class_info[i][1]) for i in range(len(class_info))]
 cmap_oem = mcolors.ListedColormap(colors)
@@ -48,7 +52,7 @@ def save_plain_mask(mask, output_path):
     plt.savefig(output_path, bbox_inches="tight", pad_inches=0, dpi=300)
     plt.close(fig)
 
-def run_inference(model_name, output_dir_name):
+def run_inference(model_name, output_dir_name, image_files):
     """Initializes a model and runs inference, saving only the predictions."""
     print(f"\n--- Running Inference for: {model_name} ---")
     print(f"--- Outputting predictions to: {output_dir_name} ---")
@@ -66,7 +70,7 @@ def run_inference(model_name, output_dir_name):
                 model_name='jbu_one',
                 model_path='simfeatup_dev/weights/xclip_jbu_one_million_aid.ckpt'),
             cls_token_lambda=-0.3, name_path='./configs/my_name.txt',
-            prob_thd=0.1, cls_variant="none", vfm_model="dino"
+            prob_thd=0.3, cls_variant="none", vfm_model="dino"
         )
     elif model_name == 'segearth':
         model = SegEarthSegmentation(
@@ -76,12 +80,12 @@ def run_inference(model_name, output_dir_name):
                 model_name='jbu_one',
                 model_path='simfeatup_dev/weights/xclip_jbu_one_million_aid.ckpt'),
             cls_token_lambda=-0.3, name_path='./configs/my_name.txt',
-            prob_thd=0.1, cls_variant="none"
+            prob_thd=0.3, cls_variant="none"
         )
     model.to('cuda')
     
     # 3. Process all images
-    image_files = list(IMAGE_DIR.glob('*.tif')) + list(IMAGE_DIR.glob('*.png')) + list(IMAGE_DIR.glob('*.jpg'))
+    # image_files = list(IMAGE_DIR.glob('*.tif')) + list(IMAGE_DIR.glob('*.png')) + list(IMAGE_DIR.glob('*.jpg'))
     for img_path in image_files:
         print(f"  Predicting for {img_path.name}...")
         base_name = img_path.stem
@@ -108,13 +112,57 @@ def run_inference(model_name, output_dir_name):
         pred_output_path = output_dir / f"{base_name}_{model_name}.png"
         save_plain_mask(seg_mask, pred_output_path)
 
+def save_legend_image(class_info, output_path):
+    """Saves a legend image based on the class_info dictionary."""
+    print(f"\n--- Creating Legend Image ---")
+    
+    # 1. 범례에 사용할 색상 패치와 클래스 이름 리스트를 만듭니다.
+    patches = [mpatches.Patch(color=info[1], label=f"{key}: {info[0]}")
+               for key, info in class_info.items()]
+    
+    # 2. 범례만 포함하는 그림(figure)을 생성합니다.
+    # 범례의 크기에 맞춰 그림 크기를 조절할 수 있습니다 (figsize).
+    fig, ax = plt.subplots(figsize=(4, 2.5))
+    
+    # 3. 그림의 축을 끄고 범례를 추가합니다.
+    ax.axis('off')
+    fig.legend(handles=patches, loc='center', fontsize='large', frameon=False)
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # 4. 여백 없이 깔끔하게 이미지 파일로 저장합니다.
+    plt.savefig(output_path, bbox_inches='tight', pad_inches=0.1, dpi=300)
+    plt.close(fig)
+    print(f"Legend saved to {output_path}")
+
 # --- 4. Main Execution Logic ---
 # Generate the model configuration file
-name_list = ['background', 'bareland,barren', 'grass', 'pavement', 'road',
-             'tree,forest', 'water,river', 'cropland', 'building,roof,house']
+name_list = ['background', 'building,roof,house', 'road', 'water', 'barren', 'forest', 'agricultural']
 with open('./configs/my_name.txt', 'w') as writer:
     for item in name_list:
         writer.write(item + '\n')
+
+if PROCESS_LABELS:
+    legend_output_path = BASE_OUTPUT_DIR / "legend.png"
+    save_legend_image(class_info, legend_output_path)
+
+print("\n--- Preparing and Sampling File List ---")
+all_image_files = sorted(list(IMAGE_DIR.glob('*.tif')) + list(IMAGE_DIR.glob('*.png')) + list(IMAGE_DIR.glob('*.jpg')))
+
+if len(all_image_files) > NUM_SAMPLES:
+    print(f"Randomly sampling {NUM_SAMPLES} images from {len(all_image_files)} total files.")
+    sampled_image_files = random.sample(all_image_files, NUM_SAMPLES)
+else:
+    print(f"Fewer than {NUM_SAMPLES} images found. Using all {len(all_image_files)} files.")
+    sampled_image_files = all_image_files
+
+print("\n--- Copying Sampled Images ---")
+output_image_dir = BASE_OUTPUT_DIR / 'image'
+output_image_dir.mkdir(parents=True, exist_ok=True) # 복사할 폴더 생성
+
+for img_path in sampled_image_files:
+    # shutil.copy(원본 경로, 대상 경로)
+    shutil.copy(img_path, output_image_dir / img_path.name)
+print(f"Copied {len(sampled_image_files)} images to {output_image_dir}")
 
 # Step 1: Process all labels once (if enabled)
 if PROCESS_LABELS:
@@ -122,8 +170,9 @@ if PROCESS_LABELS:
     output_label_dir = BASE_OUTPUT_DIR / 'label'
     output_label_dir.mkdir(parents=True, exist_ok=True)
     
-    image_files = list(IMAGE_DIR.glob('*.tif')) + list(IMAGE_DIR.glob('*.png')) + list(IMAGE_DIR.glob('*.jpg'))
-    for img_path in image_files:
+    # image_files = list(IMAGE_DIR.glob('*.tif')) + list(IMAGE_DIR.glob('*.png')) + list(IMAGE_DIR.glob('*.jpg'))
+    # for img_path in image_files:
+    for img_path in sampled_image_files:
         label_path = LABEL_DIR / img_path.name
         if label_path.is_file():
             print(f"  Saving label for {img_path.name}...")
@@ -136,12 +185,12 @@ if PROCESS_LABELS:
 
 # Step 2: Run the selected model(s) for predictions
 if MODEL_CHOICE == 'ours':
-    run_inference(model_name='ours', output_dir_name='ours')
+    run_inference(model_name='ours', output_dir_name='ours', image_files=sampled_image_files)
 elif MODEL_CHOICE == 'segearth':
-    run_inference(model_name='segearth', output_dir_name='segearth')
+    run_inference(model_name='segearth', output_dir_name='segearth', image_files=sampled_image_files)
 elif MODEL_CHOICE == 'both':
-    run_inference(model_name='ours', output_dir_name='ours')
-    run_inference(model_name='segearth', output_dir_name='segearth')
+    run_inference(model_name='ours', output_dir_name='ours', image_files=sampled_image_files)
+    run_inference(model_name='segearth', output_dir_name='segearth', image_files=sampled_image_files)
 else:
     raise ValueError("Invalid MODEL_CHOICE. Please choose 'ours', 'segearth', or 'both'.")
 

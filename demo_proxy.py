@@ -11,7 +11,7 @@ from pathlib import Path
 import matplotlib.patches as mpatches
 import torch
 
-img_path = 'demo/image/kyoto_33.tif'
+img_path = 'demo/image/zanzibar_125.tif'
 img = Image.open(img_path)
 base_name = Path(img_path).stem  # 'kyoto_33'
 
@@ -58,7 +58,7 @@ model = ProxySegEarthSegmentationCatRandom(
     name_path='./configs/my_name.txt',
     prob_thd=0.1,
     cls_variant="none",
-    vfm_model="dino"
+    vfm_model="dinov2"
 )
 # model = SamProxySegEarthSegmentation(
 #     clip_type='CLIP',     # 'CLIP', 'BLIP', 'OpenCLIP', 'MetaCLIP', 'ALIP', 'SkyCLIP', 'GeoRSCLIP', 'RemoteCLIP'

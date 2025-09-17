@@ -191,6 +191,7 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         elif vfm_model == 'dinov2':
             # self.vfm = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14_reg')
             self.vfm = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg')
+            self.dino_patch_size = 16
         elif vfm_model == 'mae':
             self.vfm = models_vit.__dict__['vit_base_patch16'](img_size=slide_crop, num_classes=0, global_pool=False)
             checkpoint_model = torch.load(checkpoint, map_location='cpu')['model']
@@ -213,6 +214,9 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
 
         self.unnorm = UnNormalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711])
         self.norm = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+
+        self.num_head = 12
+        self.head_dim = 64
 
     @torch.no_grad()
     def compute_cls_logits(self, img: torch.Tensor,
@@ -500,11 +504,11 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         if self.feature_up:
             feature_h, feature_w = img[0].shape[-2] // self.dino_patch_size, img[0].shape[-1] // self.dino_patch_size
             image_h, image_w = img[0].shape[-2], img[0].shape[-1]
-            # image_features = image_features.permute(0, 2, 1).view(1, self.feat_dim, feature_w, feature_h)
             image_features = image_features.permute(0, 2, 1).view(1, self.feat_dim, feature_h, feature_w)
             with torch.cuda.amp.autocast():
                 # --- Upsample with refinement ---
-                # image_features = self.upsampler.up2(image_features, img).half() # [1, 512, 28, 28]
+                if (feature_h, feature_w) == (14, 14):
+                    image_features = self.upsampler.up2(image_features, img).half() # [1, 512, 28, 28]
 
                 image_features = self.upsampler.up4(image_features, img).half() # [1, 512, 56, 56]]
 
@@ -602,6 +606,8 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
             I, J = clip_token_size
             ex_feats = None
         
+        h_dino, w_dino = img.shape[-2] // self.dino_patch_size, img.shape[-1] // self.dino_patch_size
+        ex_feats = F.interpolate(ex_feats, size=(h_dino, w_dino), mode='bilinear', align_corners=False)
         return ex_feats
 
     def _predict_feature_map(self, patch_img, x, crop_dino):
@@ -679,12 +685,30 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         if use_global:
             if printing: print("Phase 0: Extracting global context features...")
             with torch.no_grad():
-                global_view_img = F.interpolate(img, size=(224, 224), mode='bilinear', align_corners=False)
+                # 1. Get original image dimensions
+                h_img, w_img = img.shape[-2:]
+                target_size = 224
+
+                # 2. Calculate new size to maintain aspect ratio, fitting the longest side to 224
+                scale = target_size / max(h_img, w_img)
+                new_h, new_w = int(h_img * scale), int(w_img * scale)
+
+                # 3. Resize the image with the correct aspect ratio
+                resized_img = F.interpolate(img, size=(new_h, new_w), mode='bilinear', align_corners=False)
+
+                # 4. Calculate padding needed to make the image 224x224
+                pad_h = target_size - new_h
+                pad_w = target_size - new_w
+                
+                # 5. Add symmetrical padding (left/right, top/bottom)
+                global_view_img = F.pad(resized_img, (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2))
+
+                # global_view_img = F.interpolate(img, size=(224, 224), mode='bilinear', align_corners=False)
                 h_gl_tok, w_gl_tok = global_view_img.shape[-2] // self.patch_size[0], global_view_img.shape[-1] // self.patch_size[1]
 
                 x_global = self.net.encode_before_last_layer(global_view_img)
                 global_dino_feats = self.ref_feature_dino(global_view_img)
-                global_clip_feats = self.net.encode_value_projection(x_global, h_gl_tok, w_gl_tok)
+                global_clip_feats = self.net.encode_value_projection(x_global, h_gl_tok, w_gl_tok, target_size=(global_dino_feats.shape[-2:]))
 
                 global_dino_feats_flat = global_dino_feats.flatten(2, 3).permute(0, 2, 1).reshape(-1, global_dino_feats.shape[1])
                 global_clip_feats_flat = global_clip_feats.flatten(2, 3).permute(2, 0, 1).reshape(-1, global_clip_feats.shape[0] * global_clip_feats.shape[1])
@@ -798,11 +822,15 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
 
                     if num_external_robust > 0:
                         K = 25
+                        if self.dino_patch_size == 16:
+                            K = 10
                         K = min(K, num_external_robust)
                         kmeans = KMeans(n_clusters=K, init_method="kmeans++", mode="cosine", max_iter=25)
                         labels = kmeans.fit_predict(external_dino_feats)
 
                         M = 80
+                        if self.dino_patch_size == 16:
+                            M = 50
                         dino_samples, clip_samples = [], []
                         for cid in range(K):
                             member_indices = (labels == cid).nonzero(as_tuple=True)[0]
@@ -840,7 +868,7 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                 ref_dino, ref_clip = None, None
                 if final_ref_dino.shape[0] > 0:
                     ref_dino = final_ref_dino.t().unsqueeze(0).contiguous()
-                    ref_clip = final_ref_clip.view(-1, 12, 64).permute(1, 2, 0).contiguous()
+                    ref_clip = final_ref_clip.view(-1, self.num_head, self.head_dim).permute(1, 2, 0).contiguous()
 
                 # --- Final Prediction ---
                 y1, x1 = h_idx * h_stride, w_idx * w_stride
