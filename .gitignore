@@ -23,3 +23,5 @@ adaptive_conv_cuda_impl.cpython-310-x86_64-linux-gnu.so
 demo/
 present/
 trashcan/
+temp/
+prediction/

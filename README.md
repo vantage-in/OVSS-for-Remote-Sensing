@@ -1,3 +1,3 @@
-# UAVid: A Semantic Segmentation Dataset for UAV Imagery
+# A Semantic Segmentation
 
-UAVid is a dataset for instance segmentation, semantic segmentation, and object detection tasks.
+Hello world
