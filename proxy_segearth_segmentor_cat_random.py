@@ -699,9 +699,11 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                 # 4. Calculate padding needed to make the image 224x224
                 pad_h = target_size - new_h
                 pad_w = target_size - new_w
+                pad_top, pad_bottom = pad_h // 2, pad_h - (pad_h // 2)
+                pad_left, pad_right = pad_w // 2, pad_w - (pad_w // 2)
                 
                 # 5. Add symmetrical padding (left/right, top/bottom)
-                global_view_img = F.pad(resized_img, (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2))
+                global_view_img = F.pad(resized_img, (pad_left, pad_right, pad_top, pad_bottom))
 
                 # global_view_img = F.interpolate(img, size=(224, 224), mode='bilinear', align_corners=False)
                 h_gl_tok, w_gl_tok = global_view_img.shape[-2] // self.patch_size[0], global_view_img.shape[-1] // self.patch_size[1]
@@ -710,6 +712,18 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                 global_dino_feats = self.ref_feature_dino(global_view_img)
                 global_clip_feats = self.net.encode_value_projection(x_global, h_gl_tok, w_gl_tok, target_size=(global_dino_feats.shape[-2:]))
 
+                dino_patch_size = self.dino_patch_size
+                pad_top_feat = pad_top // dino_patch_size
+                pad_bottom_feat = pad_bottom // dino_patch_size
+                pad_left_feat = pad_left // dino_patch_size
+                pad_right_feat = pad_right // dino_patch_size
+
+                feat_h, feat_w = global_dino_feats.shape[-2:]
+
+                # unpad
+                global_dino_feats = global_dino_feats[:, :, pad_top_feat : feat_h - pad_bottom_feat, pad_left_feat : feat_w - pad_right_feat]
+                global_clip_feats = global_clip_feats[:, :, pad_top_feat : feat_h - pad_bottom_feat, pad_left_feat : feat_w - pad_right_feat]
+        
                 global_dino_feats_flat = global_dino_feats.flatten(2, 3).permute(0, 2, 1).reshape(-1, global_dino_feats.shape[1])
                 global_clip_feats_flat = global_clip_feats.flatten(2, 3).permute(2, 0, 1).reshape(-1, global_clip_feats.shape[0] * global_clip_feats.shape[1])
                 
