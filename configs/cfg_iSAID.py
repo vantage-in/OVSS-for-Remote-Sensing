@@ -4,6 +4,7 @@ _base_ = './base_config.py'
 model = dict(
     name_path='./configs/cls_iSAID.txt',
     prob_thd=0.4,
+    embedding_dir='./embeddings/isaid',
 )
 
 # dataset settings

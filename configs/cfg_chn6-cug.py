@@ -3,7 +3,8 @@ _base_ = './base_config.py'
 # model settings
 model = dict(
     name_path='./configs/cls_chn6-cug.txt',
-    prob_thd=0.85 # 0.8
+    prob_thd=0.85, #0.85 # 0.8
+    embedding_dir='./embeddings/chn6-cug',
 )
 
 # dataset settings

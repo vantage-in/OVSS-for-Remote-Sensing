@@ -2,7 +2,6 @@ import os
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import argparse
 import segearth_segmentor
-import proxy_segearth_segmentor
 import custom_datasets
 
 from mmengine.config import Config

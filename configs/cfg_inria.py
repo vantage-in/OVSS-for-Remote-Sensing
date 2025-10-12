@@ -3,7 +3,8 @@ _base_ = './base_config.py'
 # model settings
 model = dict(
     name_path='./configs/cls_inria.txt',
-    prob_thd=0.65, # 0.6 is original
+    prob_thd=0.65, #0.65, # 0.6 is original
+    embedding_dir='./embeddings/inria',
 )
 
 # dataset settings

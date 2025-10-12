@@ -4,6 +4,8 @@ _base_ = './base_config.py'
 model = dict(
     name_path='./configs/cls_uavid.txt',
     prob_thd=0.3,
+    embedding_dir='./embeddings/uavid',
+    vfm_embedding_dir='./dinov3_features_448/UAVid'
 )
 
 # dataset settings

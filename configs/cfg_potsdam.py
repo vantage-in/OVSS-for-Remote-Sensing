@@ -5,6 +5,8 @@ model = dict(
     name_path='./configs/cls_potsdam.txt',
     prob_thd=0.1,
     bg_idx=5,
+    embedding_dir='./embeddings/potsdam',
+    vfm_embedding_dir='./dinov3_features_448/potsdam'
 )
 
 # dataset settings

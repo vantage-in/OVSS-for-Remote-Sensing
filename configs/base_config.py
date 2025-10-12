@@ -5,7 +5,7 @@
 #     vit_type='ViT-B/16',      # 'ViT-B/16', 'ViT-L-14'
 #     model_type='SegEarth',   # 'vanilla', 'MaskCLIP', 'GEM', 'SCLIP', 'ClearCLIP', 'SegEarth'
 #     ignore_residual=True,
-#     feature_up=True,
+#     feature_up=False, # True
 #     feature_up_cfg=dict(
 #         model_name='jbu_one',
 #         model_path='simfeatup_dev/weights/xclip_jbu_one_million_aid.ckpt'),
@@ -26,8 +26,18 @@ model = dict(
         model_path='simfeatup_dev/weights/xclip_jbu_one_million_aid.ckpt'),
     cls_token_lambda=-0.3,
     cls_variant="none",
-    vfm_model="dino"
+    vfm_model="dino",
+    context_mode='multiscale_gating'
 )
+"""
+Options for context_mode:
+- 'dino_proxy': No additonal embeddings.
+- 'global_only': Uses only global embeddings.
+- 'sampling_only': Uses only sampled embeddings.
+- 'sampling_and_global': Uses both sampled and global embeddings. (No gating)
+- 'gating': Single-scale gating for global embeddings.
+- 'multiscale_gating': Multi-scale gating for global embeddings.
+"""
 
 test_evaluator = dict(type='IoUMetric', iou_metrics=['mIoU'])
 

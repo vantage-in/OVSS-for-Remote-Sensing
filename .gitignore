@@ -25,3 +25,8 @@ present/
 trashcan/
 temp/
 prediction/
+final_results/
+VFM_exp/
+mae/
+checkpoint/
+SegEarth.tar.gz

@@ -4,6 +4,9 @@ _base_ = './base_config.py'
 model = dict(
     name_path='./configs/cls_vdd.txt',
     prob_thd=0.3,
+    embedding_dir='./embeddings/vdd',
+    vfm_embedding_dir='./dinov3_features_448/VDD'
+    # kmeans_dir='./kmeans/vdd/42'
 )
 
 # dataset settings

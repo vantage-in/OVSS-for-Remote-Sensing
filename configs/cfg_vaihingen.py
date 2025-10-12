@@ -5,6 +5,8 @@ model = dict(
     name_path='./configs/cls_vaihingen.txt',
     prob_thd=0.1,
     bg_idx=5,
+    embedding_dir='./embeddings/vaihingen',
+    # vfm_embedding_dir='./dinov3_features_448/vaihingen'
 )
 
 # dataset settings

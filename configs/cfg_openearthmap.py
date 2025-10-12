@@ -3,7 +3,9 @@ _base_ = './base_config.py'
 # model settings
 model = dict(
     name_path='./configs/cls_openearthmap.txt',
-    prob_thd=0.1
+    prob_thd=0.1,
+    embedding_dir='./embeddings/openearthmap',
+    # vfm_embedding_dir='./dinov3_features_448/OpenEarthMap'
 )
 
 # dataset settings

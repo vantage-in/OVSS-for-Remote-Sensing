@@ -5,6 +5,9 @@ model = dict(
     name_path='./configs/cls_udd5.txt',
     prob_thd=0.4,
     bg_idx=4,
+    embedding_dir='./embeddings/udd5',
+    vfm_embedding_dir='./dinov3_features_448/UDD5'
+    # kmeans_dir='./kmeans/udd5/42'
 )
 
 # dataset settings

@@ -3,8 +3,9 @@ _base_ = './base_config.py'
 # model settings
 model = dict(
     name_path='./configs/cls_xBD.txt',
-    prob_thd=0.05, # 0.0
+    prob_thd=0.05, #0.05, # 0.0
     cls_token_lambda=0, # 0 is original
+    embedding_dir='./embeddings/xBD',
 )
 
 # dataset settings

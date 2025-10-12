@@ -3,7 +3,8 @@ _base_ = './base_config.py'
 # model settings
 model = dict(
     name_path='./configs/cls_roadval.txt',
-    prob_thd=0.75, # 0.7
+    prob_thd=0.75, #0.75, # 0.7
+    embedding_dir='./embeddings/spacenet_road',
 )
 
 # dataset settings

@@ -18,10 +18,6 @@ from BLIP.models.blip_retrieval import blip_retrieval
 import gem
 from simfeatup_dev.upsamplers import get_upsampler
 
-from mae import models_vit
-from mae.pos_embed import interpolate_pos_embed
-from einops import rearrange
-
 import torchvision.transforms as T  
 from typing import Optional
 import math, os
@@ -58,8 +54,6 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                      model_path='your/model/path'),
                  cls_variant: Optional[str] = None,
                  embedding_dir: Optional[str] = None,
-                 vfm_embedding_dir: Optional[str] = None,
-                 kmeans_dir: Optional[str] = None,
                  context_mode: Optional[str] = None,
                  vfm_model=None,
                  **kwargs):
@@ -188,26 +182,20 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
 
         self.vfm_model = vfm_model
         if vfm_model == 'sam':
-            checkpoint = 'checkpoint/sam_vit_b_01ec64.pth'
+            checkpoint = None
             self.vfm = sam_model_registry["vit_b"](checkpoint=checkpoint)
-            # checkpoint = 'checkpoint/sam_vit_l_0b3195.pth'
             # self.vfm = sam_model_registry["vit_l"](checkpoint=checkpoint)
-            self.dino_patch_size = 4
         elif vfm_model == 'dino':
             # self.vfm = torch.hub.load('facebookresearch/dino:main', 'dino_vits16')
             # self.vfm = torch.hub.load('facebookresearch/dino:main', 'dino_vits8')
             # self.vfm = torch.hub.load('facebookresearch/dino:main', 'dino_vitb16')
             self.vfm = torch.hub.load('facebookresearch/dino:main', 'dino_vitb8')
             self.dino_patch_size = 8
-        elif vfm_model == 'dino_vitb16':
-            self.vfm = torch.hub.load('facebookresearch/dino:main', 'dino_vitb16')
-            self.dino_patch_size = 8
         elif vfm_model == 'dinov2':
             # self.vfm = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14_reg')
             self.vfm = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg')
-            self.dino_patch_size = 8
+            self.dino_patch_size = 16
         elif vfm_model == 'mae':
-            checkpoint = 'checkpoint/mae_pretrain_vit_base.pth'
             self.vfm = models_vit.__dict__['vit_base_patch16'](img_size=slide_crop, num_classes=0, global_pool=False)
             checkpoint_model = torch.load(checkpoint, map_location='cpu')['model']
             state_dict = self.vfm.state_dict()
@@ -219,7 +207,6 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
             interpolate_pos_embed(self.vfm, checkpoint_model)
             # load pre-trained model
             self.vfm.load_state_dict(checkpoint_model, strict=False)
-            self.dino_patch_size = 16
         else:
             print("vlm_model not supported")
 
@@ -235,8 +222,6 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         self.head_dim = 64
 
         self.embedding_dir = embedding_dir
-        self.vfm_embedding_dir = vfm_embedding_dir
-        self.kmeans_dir = kmeans_dir
         self.context_mode = context_mode
 
     @torch.no_grad()
@@ -495,16 +480,16 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
             cls_logits = self.compute_cls_logits(img)
 
         # featup
-        feature_h, feature_w = img[0].shape[-2] // self.dino_patch_size, img[0].shape[-1] // self.dino_patch_size
         if self.feature_up:
+            feature_h, feature_w = img[0].shape[-2] // self.dino_patch_size, img[0].shape[-1] // self.dino_patch_size
             image_h, image_w = img[0].shape[-2], img[0].shape[-1]
             image_features = image_features.permute(0, 2, 1).view(1, self.feat_dim, feature_h, feature_w)
             with torch.cuda.amp.autocast():
                 # --- Upsample with refinement ---
-                if image_features.shape[-2:] == (14, 14):
+                if (feature_h, feature_w) == (14, 14):
                     image_features = self.upsampler.up2(image_features, img).half() # [1, 512, 28, 28]
-                if image_features.shape[-2:] == (28, 28):
-                    image_features = self.upsampler.up4(image_features, img).half() # [1, 512, 56, 56]]
+
+                image_features = self.upsampler.up4(image_features, img).half() # [1, 512, 56, 56]]
 
                 image_features = self.upsampler.up8(image_features, img).half() # [1, 512, 112, 112]
 
@@ -528,12 +513,12 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         out_dim = logits.shape[-1]
 
         # for proxy and not featup only
-        if self.vfm_model is not None and not self.feature_up:
-            logits = logits.permute(0, 2, 1).reshape(-1, out_dim, feature_h, feature_w)
-        else:
-            logits = logits.permute(0, 2, 1).reshape(-1, out_dim, h, w)
-        # # Original
-        # logits = logits.permute(0, 2, 1).reshape(-1, out_dim, h, w)
+        # if self.vfm_model is not None:
+        #     logits = logits.permute(0, 2, 1).reshape(-1, out_dim, I, J)
+        # else:
+        #     logits = logits.permute(0, 2, 1).reshape(-1, out_dim, h, w)
+        # Original
+        logits = logits.permute(0, 2, 1).reshape(-1, out_dim, h, w)
 
         if logit_size == None:
             logits = nn.functional.interpolate(logits, size=img.shape[-2:], mode='bilinear')
@@ -555,18 +540,14 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
             imgs_norm = F.interpolate(imgs_norm, size=(1024, 1024), mode='bilinear', align_corners=False)
             I, J = imgs_norm.shape[-2] // patch_size[0], imgs_norm.shape[-2] // patch_size[1]
             ex_feats = self.vfm.image_encoder(imgs_norm)
-        elif self.vfm_model == 'dino' or self.vfm_model == 'dino_vitb16':
+        elif self.vfm_model == 'dino':
             feat_out = {}
             def hook_fn_forward_qkv(module, input, output):
                 feat_out["qkv"] = output
             self.vfm._modules["blocks"][-1]._modules["attn"]._modules["qkv"].register_forward_hook(
                 hook_fn_forward_qkv)
 
-            patch_size = self.vfm.patch_embed.patch_size
-            
             # Forward pass in the model
-            if self.vfm_model == 'dino_vitb16':
-                imgs_norm = F.interpolate(imgs_norm, size=(patch_size * 28, patch_size * 28), mode='bilinear', align_corners=False)
             feat = self.vfm.get_intermediate_layers(imgs_norm)[0]
 
             nb_im = feat.shape[0]  # Batch size
@@ -583,6 +564,7 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
             q = q.transpose(1, 2).reshape(nb_im, nb_tokens, -1)[:, 1:, :]
             v = v.transpose(1, 2).reshape(nb_im, nb_tokens, -1)[:, 1:, :]
 
+            patch_size = self.vfm.patch_embed.patch_size
             I, J = imgs_norm[0].shape[-2] // patch_size, imgs_norm[0].shape[-1] // patch_size
 
             # ex_feats = q.reshape(nb_im, I, J, -1).permute(0, 3, 1, 2)
@@ -591,7 +573,6 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
             ex_feats = feat[:, 1:, :].reshape(nb_im, I, J, -1).permute(0, 3, 1, 2)
         elif self.vfm_model == 'dinov2':
             patch_size = self.vfm.patch_embed.patch_size
-            imgs_norm = F.interpolate(imgs_norm, size=(patch_size[0] * 28, patch_size[1] * 28), mode='bilinear', align_corners=False)
             I, J = imgs_norm.shape[-2] // patch_size[0], imgs_norm.shape[-1] // patch_size[1]
             ex_feats = self.vfm.get_intermediate_layers(imgs_norm, reshape=True)[0]
         elif self.vfm_model == 'mae':
@@ -634,7 +615,7 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         return seg_pred.squeeze(0) # [28, 28]
 
     # Best
-    def forward_slide(self, img, img_metas, stride=112, crop_size=224, context_mode='multiscale_gating'):
+    def forward_slide(self, img, img_metas, stride=112, crop_size=224, context_mode='global_only'):
         """
         [MODIFIED] Adds a `context_mode` option to control the context embeddings.
         Options for context_mode:
@@ -679,89 +660,86 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
         w_grids = max(w_img - w_crop + w_stride - 1, 0) // w_stride + 1
         device = img.device
         
-        if self.embedding_dir is not None:
-            sample = img_metas[0]
-            img_path = sample['img_path']
-            basename = osp.basename(img_path)
-            filename_without_ext = osp.splitext(basename)[0]
-            embedding_path = osp.join(self.embedding_dir, f"{filename_without_ext}.pt")
-
-            try:
-                embeddings = torch.load(embedding_path, map_location=img.device)
-
-                if self.vfm_embedding_dir is not None:
-                    vfm_embedding_path = osp.join(self.vfm_embedding_dir, f"{filename_without_ext}.pt")
-                    vfm_embeddings = torch.load(vfm_embedding_path, map_location=img.device)
-                
-                # 불러온 텐서에 배치 차원(unsqueeze) 추가
-                global_dino_feats_flat = embeddings['global_dino_feats_flat'].to(dtype=torch.float32) if self.vfm_embedding_dir is None else vfm_embeddings['global_dino_feats_flat'].to(dtype=torch.float32)
-                global_clip_feats_flat = embeddings['global_clip_feats_flat'].to(dtype=torch.float32)
-                all_robust_dino_feats  = embeddings['all_robust_dino_feats'].to(dtype=torch.float32) if self.vfm_embedding_dir is None else vfm_embeddings['all_robust_dino_feats'].to(dtype=torch.float32)
-                all_robust_clip_feats  = embeddings['all_robust_clip_feats'].to(dtype=torch.float32)
-
-                # all_robust_patch_ids는 ID이므로 데이터 타입 변경 불필요
-                all_robust_patch_ids   = embeddings['all_robust_patch_ids']
-                
-                # all_last_feats는 리스트이므로, 리스트 내 각 텐서의 데이터 타입을 변경
-                all_last_feats = [t.to(device=img.device) for t in embeddings['all_last_feats']]
-
-            except FileNotFoundError:
-                raise FileNotFoundError(f"Embedding file not found: {embedding_path}. "
-                                      f"Please run extract_embeddings.py first.")
-
-        else:
-            # ========================================================================
-            # Phase 0: Extract global features if needed
-            # ========================================================================
-            global_dino_feats_flat, global_clip_feats_flat = None, None
-            if use_global:
-                if printing: print("Phase 0: Extracting global context features...")
-                with torch.no_grad():
-                    # 1. Get original image dimensions
-                    h_img, w_img = img.shape[-2:]
-                    target_size = 224 # [수정요망] CLIP은 224, DINO는 448로 진행하는 게 나음
-
-                    # 2. Calculate new size to maintain aspect ratio, fitting the longest side to 224
-                    scale = target_size / max(h_img, w_img)
-                    new_h, new_w = int(h_img * scale), int(w_img * scale)
-
-                    # 3. Resize the image with the correct aspect ratio
-                    resized_img = F.interpolate(img, size=(new_h, new_w), mode='bilinear', align_corners=False)
-
-                    # 4. Calculate padding needed to make the image 224x224
-                    pad_h = target_size - new_h
-                    pad_w = target_size - new_w
-                    pad_top, pad_bottom = pad_h // 2, pad_h - (pad_h // 2)
-                    pad_left, pad_right = pad_w // 2, pad_w - (pad_w // 2)
-                    
-                    # 5. Add symmetrical padding (left/right, top/bottom)
-                    global_view_img = F.pad(resized_img, (pad_left, pad_right, pad_top, pad_bottom))
-
-                    # global_view_img = F.interpolate(img, size=(224, 224), mode='bilinear', align_corners=False)
-                    h_gl_tok, w_gl_tok = global_view_img.shape[-2] // self.patch_size[0], global_view_img.shape[-1] // self.patch_size[1]
-
-                    x_global = self.net.encode_before_last_layer(global_view_img)
-                    global_dino_feats = self.ref_feature_dino(global_view_img)
-                    global_clip_feats = self.net.encode_value_projection(x_global, h_gl_tok, w_gl_tok, target_size=(global_dino_feats.shape[-2:]))
-
-                    # dino_patch_size = self.dino_patch_size
-                    # pad_top_feat = pad_top // dino_patch_size
-                    # pad_bottom_feat = pad_bottom // dino_patch_size
-                    # pad_left_feat = pad_left // dino_patch_size
-                    # pad_right_feat = pad_right // dino_patch_size
-
-                    # feat_h, feat_w = global_dino_feats.shape[-2:]
-
-                    # # unpad
-                    # global_dino_feats = global_dino_feats[:, :, pad_top_feat : feat_h - pad_bottom_feat, pad_left_feat : feat_w - pad_right_feat]
-                    # global_clip_feats = global_clip_feats[:, :, pad_top_feat : feat_h - pad_bottom_feat, pad_left_feat : feat_w - pad_right_feat]
+        sample = img_metas[0]
+        img_path = sample['img_path']
+        basename = osp.basename(img_path)
+        filename_without_ext = osp.splitext(basename)[0]
+        embedding_path = osp.join(self.embedding_dir, f"{filename_without_ext}.pt")
+        
+        try:
+            embeddings = torch.load(embedding_path, map_location=img.device)
             
-                    global_dino_feats_flat = global_dino_feats.flatten(2, 3).permute(0, 2, 1).reshape(-1, global_dino_feats.shape[1])
-                    global_clip_feats_flat = global_clip_feats.flatten(2, 3).permute(2, 0, 1).reshape(-1, global_clip_feats.shape[0] * global_clip_feats.shape[1])
-                    
-                    global_dino_feats_flat = global_dino_feats_flat.to(dtype=torch.float32)
-                    global_clip_feats_flat = global_clip_feats_flat.to(dtype=torch.float32)
-                    if printing: print(f"  - Extracted {global_dino_feats_flat.shape[0]} global feature pairs.")
+            # 불러온 텐서에 배치 차원(unsqueeze) 추가
+            loaded_global_dino_feats_flat = embeddings['global_dino_feats_flat'].to(dtype=torch.float32)
+            loaded_global_clip_feats_flat = embeddings['global_clip_feats_flat'].to(dtype=torch.float32)
+            loaded_all_robust_dino_feats  = embeddings['all_robust_dino_feats'].to(dtype=torch.float32)
+            loaded_all_robust_clip_feats  = embeddings['all_robust_clip_feats'].to(dtype=torch.float32)
+            
+            # all_robust_patch_ids는 ID이므로 데이터 타입 변경 불필요
+            loaded_all_robust_patch_ids   = embeddings['all_robust_patch_ids']
+            
+            # all_last_feats는 리스트이므로, 리스트 내 각 텐서의 데이터 타입을 변경
+            loaded_all_last_feats = [t.to(device=img.device) for t in embeddings['all_last_feats']]
+
+            loaded_inputs = embeddings['__debug_inputs'] # 저장된 inputs 텐서 로드
+            print("Step B: Done.")
+
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Embedding file not found: {embedding_path}. "
+                                    f"Please run extract_embeddings.py first.")
+
+        # ========================================================================
+        # Phase 0: Extract global features if needed
+        # ========================================================================
+        global_dino_feats_flat, global_clip_feats_flat = None, None
+        if use_global:
+            if printing: print("Phase 0: Extracting global context features...")
+            with torch.no_grad():
+                # 1. Get original image dimensions
+                h_img, w_img = img.shape[-2:]
+                target_size = 224
+
+                # 2. Calculate new size to maintain aspect ratio, fitting the longest side to 224
+                scale = target_size / max(h_img, w_img)
+                new_h, new_w = int(h_img * scale), int(w_img * scale)
+
+                # 3. Resize the image with the correct aspect ratio
+                resized_img = F.interpolate(img, size=(new_h, new_w), mode='bilinear', align_corners=False)
+
+                # 4. Calculate padding needed to make the image 224x224
+                pad_h = target_size - new_h
+                pad_w = target_size - new_w
+                pad_top, pad_bottom = pad_h // 2, pad_h - (pad_h // 2)
+                pad_left, pad_right = pad_w // 2, pad_w - (pad_w // 2)
+                
+                # 5. Add symmetrical padding (left/right, top/bottom)
+                global_view_img = F.pad(resized_img, (pad_left, pad_right, pad_top, pad_bottom))
+
+                # global_view_img = F.interpolate(img, size=(224, 224), mode='bilinear', align_corners=False)
+                h_gl_tok, w_gl_tok = global_view_img.shape[-2] // self.patch_size[0], global_view_img.shape[-1] // self.patch_size[1]
+
+                x_global = self.net.encode_before_last_layer(global_view_img)
+                global_dino_feats = self.ref_feature_dino(global_view_img)
+                global_clip_feats = self.net.encode_value_projection(x_global, h_gl_tok, w_gl_tok, target_size=(global_dino_feats.shape[-2:]))
+
+                # dino_patch_size = self.dino_patch_size
+                # pad_top_feat = pad_top // dino_patch_size
+                # pad_bottom_feat = pad_bottom // dino_patch_size
+                # pad_left_feat = pad_left // dino_patch_size
+                # pad_right_feat = pad_right // dino_patch_size
+
+                # feat_h, feat_w = global_dino_feats.shape[-2:]
+
+                # # unpad
+                # global_dino_feats = global_dino_feats[:, :, pad_top_feat : feat_h - pad_bottom_feat, pad_left_feat : feat_w - pad_right_feat]
+                # global_clip_feats = global_clip_feats[:, :, pad_top_feat : feat_h - pad_bottom_feat, pad_left_feat : feat_w - pad_right_feat]
+        
+                global_dino_feats_flat = global_dino_feats.flatten(2, 3).permute(0, 2, 1).reshape(-1, global_dino_feats.shape[1])
+                global_clip_feats_flat = global_clip_feats.flatten(2, 3).permute(2, 0, 1).reshape(-1, global_clip_feats.shape[0] * global_clip_feats.shape[1])
+                
+                global_dino_feats_flat = global_dino_feats_flat.to(dtype=torch.float32)
+                global_clip_feats_flat = global_clip_feats_flat.to(dtype=torch.float32)
+                if printing: print(f"  - Extracted {global_dino_feats_flat.shape[0]} global feature pairs.")
 
             # ========================================================================
             # Phase 1: Collect and sample patch features if needed
@@ -823,6 +801,79 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
                     num_total_robust = all_robust_dino_feats.shape[0]
                     print(f"  - Collected {num_total_robust} robust feature embeddings in total.")
 
+
+        print("\nStep C: Comparing all tensors...")
+        
+        tensors_to_compare = {
+            "global_dino_feats_flat": (global_dino_feats_flat, loaded_global_dino_feats_flat),
+            "global_clip_feats_flat": (global_clip_feats_flat, loaded_global_clip_feats_flat),
+            "all_robust_dino_feats": (all_robust_dino_feats, loaded_all_robust_dino_feats),
+            "all_robust_clip_feats": (all_robust_clip_feats, loaded_all_robust_clip_feats),
+            "all_robust_patch_ids": (all_robust_patch_ids, loaded_all_robust_patch_ids),
+        }
+
+        all_match = True
+        for name, (realtime_t, loaded_t) in tensors_to_compare.items():
+            print(f"--- Comparing: {name} ---")
+            shape_match = realtime_t.shape == loaded_t.shape
+            dtype_match = realtime_t.dtype == loaded_t.dtype
+            # atol(absolute tolerance)은 float16/32의 미세한 오차를 감안하기 위해 필요합니다.
+            value_match = torch.allclose(realtime_t.float(), loaded_t.float(), atol=1e-5)
+            
+            print(f"  Shape Match: {shape_match} ({realtime_t.shape} vs {loaded_t.shape})")
+            print(f"  Dtype Match: {dtype_match} ({realtime_t.dtype} vs {loaded_t.dtype})")
+            print(f"  Value Match: {value_match}")
+            
+            if not (shape_match and dtype_match and value_match):
+                all_match = False
+
+        # `all_last_feats` (리스트) 비교
+        print("--- Comparing: all_last_feats (list) ---")
+        if len(all_last_feats) != len(loaded_all_last_feats):
+            print(f"  Length Mismatch: {len(all_last_feats)} vs {len(loaded_all_last_feats)}")
+            all_match = False
+        else:
+            for i, (realtime_t, loaded_t) in enumerate(zip(all_last_feats, loaded_all_last_feats)):
+                if not torch.allclose(realtime_t.float(), loaded_t.float(), atol=1e-5):
+                    print(f"  Value Mismatch at index {i}")
+                    all_match = False
+                    break
+            else:
+                print("  Values Match!")
+
+        print("\n========================================================")
+        if all_match:
+            print("✅ SUCCESS: All real-time and loaded tensors are identical!")
+        else:
+            print("❌ FAILURE: Discrepancy found between tensors!")
+        print("========================================================\n")
+        
+        # --- [C] 두 `inputs` 텐서 직접 비교 ---
+        print("\nStep C: Comparing preprocessed `inputs` tensors...")
+        shape_match = img.shape == loaded_inputs.shape
+        dtype_match = img.dtype == loaded_inputs.dtype
+        value_match = torch.allclose(img, loaded_inputs, atol=1e-5)
+
+        print(f"  Shape Match: {shape_match} ({img.shape} vs {loaded_inputs.shape})")
+        print(f"  Dtype Match: {dtype_match} ({img.dtype} vs {loaded_inputs.dtype})")
+        print(f"  Value Match: {value_match}")
+
+        print("\n========================================================")
+        if not value_match:
+            print("🔥 ROOT CAUSE IDENTIFIED: Preprocessed image tensors are DIFFERENT.")
+            print("   This confirms the issue is in the data loading/preprocessing pipeline.")
+            diff = torch.abs(img.float() - loaded_inputs.float())
+            print(f"   Max difference: {torch.max(diff)}")
+            print(f"   Mean difference: {torch.mean(diff)}")
+        else:
+            print("✅ SUCCESS: Preprocessed inputs are IDENTICAL. The issue is NOT in the pipeline.")
+        print("========================================================\n")
+        # =================================================================
+        #                    [DEBUGGING CODE END]
+        # =================================================================
+
+
+
         # ========================================================================
         # Phase 2 & 3: Final prediction with selected context
         # ========================================================================
@@ -854,64 +905,47 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
 
                 # --- Perform K-means sampling if needed ---
                 if use_sampling and all_robust_dino_feats is not None:
-                    if self.kmeans_dir is not None:
-                        sample = img_metas[0]
-                        img_path = sample['img_path']
-                        basename = osp.basename(img_path)
-                        filename_without_ext = osp.splitext(basename)[0]
-                        kmeans_path = osp.join(self.kmeans_dir, f"{filename_without_ext}.pt")
+                    external_mask = (all_robust_patch_ids != patch_counter)
+                    external_dino_feats = all_robust_dino_feats[external_mask]
+                    external_clip_feats = all_robust_clip_feats[external_mask]
+                    num_external_robust = external_dino_feats.shape[0]
 
-                        if not hasattr(self, '_cached_kmeans_data') or self._cached_kmeans_path != kmeans_path:
-                            self._cached_kmeans_data = torch.load(kmeans_path, map_location='cpu')
-                            self._cached_kmeans_path = kmeans_path
+                    # internal_mask = (all_robust_patch_ids == patch_counter)
+                    # internal_dino_feats = all_robust_dino_feats[internal_mask]
+                    # #internal_dino_feats = internal_dino_feats.permute(1, 0).reshape(-1, 28, 28).unsqueeze(0) # <- 위험
 
-                        patch_results = self._cached_kmeans_data[patch_counter]
-                        sampled_dino = patch_results['sampled_dino'].to(img.device) if patch_results['sampled_dino'] is not None else None
-                        sampled_clip = patch_results['sampled_clip'].to(img.device) if patch_results['sampled_clip'] is not None else None
-                    else:
-                        external_mask = (all_robust_patch_ids != patch_counter)
-                        external_dino_feats = all_robust_dino_feats[external_mask]
-                        external_clip_feats = all_robust_clip_feats[external_mask]
-                        num_external_robust = external_dino_feats.shape[0]
+                    if printing: 
+                        print(f"  - Performing K-Means on {num_external_robust} feature embeddings.")
 
-                        # internal_mask = (all_robust_patch_ids == patch_counter)
-                        # internal_dino_feats = all_robust_dino_feats[internal_mask]
-                        # #internal_dino_feats = internal_dino_feats.permute(1, 0).reshape(-1, 28, 28).unsqueeze(0) # <- 위험
+                    if num_external_robust > 0:
+                        K = 25
+                        if self.dino_patch_size == 16:
+                            K = 10
+                        K = min(K, num_external_robust)
+                        kmeans = KMeans(n_clusters=K, init_method="kmeans++", mode="cosine", max_iter=25)
+                        labels = kmeans.fit_predict(external_dino_feats)
 
-                        if printing: 
-                            print(f"  - Performing K-Means on {num_external_robust} feature embeddings.")
-
-                        if num_external_robust > 0:
-                            K = 25
-                            if self.dino_patch_size == 16:
-                                K = 10
-                            K = min(K, num_external_robust)
-                            kmeans = KMeans(n_clusters=K, init_method="kmeans++", mode="cosine", max_iter=25)
-                            labels = kmeans.fit_predict(external_dino_feats)
-
-                            M = 80
-                            if self.dino_patch_size == 16:
-                                M = 50
-                            elif self.dino_patch_size == 4:
-                                M = 120
-                            dino_samples, clip_samples = [], []
-                            for cid in range(K):
-                                member_indices = (labels == cid).nonzero(as_tuple=True)[0]
-                                if len(member_indices) == 0: continue
-                                
-                                torch.manual_seed(42)
-                                if len(member_indices) > M:
-                                    rand_indices = member_indices[torch.randperm(len(member_indices), device=device)[:M]]
-                                else:
-                                    rand_indices = member_indices[torch.randint(0, len(member_indices), (M,), device=device)]
-                                
-                                dino_samples.append(external_dino_feats[rand_indices])
-                                clip_samples.append(external_clip_feats[rand_indices])
+                        M = 80
+                        if self.dino_patch_size == 16:
+                            M = 50
+                        dino_samples, clip_samples = [], []
+                        for cid in range(K):
+                            member_indices = (labels == cid).nonzero(as_tuple=True)[0]
+                            if len(member_indices) == 0: continue
                             
-                        if dino_samples:
-                            sampled_dino = torch.cat(dino_samples, dim=0)
-                            sampled_clip = torch.cat(clip_samples, dim=0)
-                            num_sampled = sampled_dino.shape[0]
+                            torch.manual_seed(42)
+                            if len(member_indices) > M:
+                                rand_indices = member_indices[torch.randperm(len(member_indices), device=device)[:M]]
+                            else:
+                                rand_indices = member_indices[torch.randint(0, len(member_indices), (M,), device=device)]
+                            
+                            dino_samples.append(external_dino_feats[rand_indices])
+                            clip_samples.append(external_clip_feats[rand_indices])
+                        
+                    if dino_samples:
+                        sampled_dino = torch.cat(dino_samples, dim=0)
+                        sampled_clip = torch.cat(clip_samples, dim=0)
+                        num_sampled = sampled_dino.shape[0]
                     
                 # --- Construct final reference features based on context_mode ---
                 dino_frags, clip_frags = [], []
@@ -948,15 +982,8 @@ class ProxySegEarthSegmentationCatRandom(BaseSegmentor):
 
                 if not use_sampling:
                     crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=None, last_feats=None) #internal_dino_feats
-                elif self.vfm_embedding_dir is not None:
-                    ex_feats = all_robust_dino_feats[patch_counter*784:(patch_counter+1)*784,:]
-                    ex_feats = ex_feats.permute(1, 0).view(-1, 28, 28).unsqueeze(0)
-                    crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=ex_feats, last_feats=all_last_feats[patch_counter], hf_score=hf_score, num_sampled=num_sampled) #internal_dino_feats
                 else:
-                    ex_feats = all_robust_dino_feats[patch_counter*784:(patch_counter+1)*784,:]
-                    ex_feats = ex_feats.permute(1, 0).view(-1, 28, 28).unsqueeze(0)
-                    crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=ex_feats, last_feats=all_last_feats[patch_counter], hf_score=hf_score, num_sampled=num_sampled) #internal_dino_feats
-                    # crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=None, last_feats=all_last_feats[patch_counter], hf_score=hf_score, num_sampled=num_sampled) #internal_dino_feats
+                    crop_seg_logit = self.forward_feature(padded_crop_img, ref_dino, ref_clip, ex_feats=None, last_feats=all_last_feats[patch_counter], hf_score=hf_score, num_sampled=num_sampled) #internal_dino_feats
 
                 # --- 예측 결과에서 패딩 제거 ---
                 if any(pad):

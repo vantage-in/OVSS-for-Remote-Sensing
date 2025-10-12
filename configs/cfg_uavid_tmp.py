@@ -2,15 +2,13 @@ _base_ = './base_config.py'
 
 # model settings
 model = dict(
-    name_path='./configs/cls_loveda.txt',
+    name_path='./configs/cls_uavid.txt',
     prob_thd=0.3,
-    embedding_dir='./embeddings/loveda',
+    vfm_model="dinov2"
 )
 
 # dataset settings
-# Category labels: background – 1, building – 2, road – 3, water – 4, barren – 5,forest – 6, agriculture – 7. 
-# And the no-data regions were assigned 0 which should be ignored. 
-dataset_type = 'LoveDADataset'
+dataset_type = 'UAVidDataset'
 data_root = ''
 
 test_pipeline = [
@@ -25,13 +23,11 @@ test_pipeline = [
 test_dataloader = dict(
     batch_size=1,
     num_workers=4,
-    persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
         type=dataset_type,
         data_root=data_root,
-        reduce_zero_label=True,
         data_prefix=dict(
-            img_path='data/LoveDA/img_dir/val',
-            seg_map_path='data/LoveDA/ann_dir/val'),
+            img_path='data/UAVid/img_dir/test',
+            seg_map_path='data/UAVid/ann_dir/test'),
         pipeline=test_pipeline))
